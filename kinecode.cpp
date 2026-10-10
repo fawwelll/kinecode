@@ -21,7 +21,10 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.2-cpp";
+const std::string VERSION = "0.3";
+
+int lang = 0; // 0=ru, 1=en
+std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
 
 fs::path conf_dir() {
     const char* xdg = std::getenv("XDG_CONFIG_HOME");
@@ -64,14 +67,31 @@ ______  _____ _____ ___________ _____
 \_| |_/\_| |_/\_| \_\_| \_/\____/\____/\____/
 )";
 
-const char* ABOUT_TEXT = R"(kinecode v{version} — минималистичный терминальный клиент
-для OpenAI-совместимых API.
+std::string about_text() {
+    if (lang) return "kinecode v" + VERSION + " - minimal terminal client for OpenAI-compatible APIs.\n\nCreated by fawwelll, Telegramm channel @jailbraked\n\nC++17 + libcurl + nlohmann/json.";
+    return "kinecode v" + VERSION + " - минималистичный терминальный клиент для OpenAI-совместимых API.\n\nCreated by fawwelll, Telegramm channel @jailbraked\n\nC++17 + libcurl + nlohmann/json.";
+}
 
-Created by fawwelll, Telegramm channel @jailbraked
-
-Только C++17 + libcurl + nlohmann/json.)";
-
-const char* HELP_TEXT = R"(Команды:
+std::string help_text() {
+    if (lang) return R"(Commands:
+  /providers              list providers
+  /provider [name]        switch provider
+  /models                 list models
+  /model [name|num]       select model
+  /fetchmodels            fetch models from server
+  /addprovider [name]     add provider
+  /delprovider name       remove provider
+  /key [name]             change API key
+  /system [text]          show/set system prompt
+  /think on|off           toggle reasoning output
+  /file <path> [question] send text file
+  /img <path> [question]  send image (png/jpg/webp/gif)
+  /language ru|en         switch language
+  /about                  about
+  /clear                  clear chat
+  /help  /exit
+Ctrl+C interrupts streaming.)";
+    return R"(Команды:
   /providers              список провайдеров
   /provider [имя]         переключить провайдера
   /models                 модели текущего провайдера
@@ -84,10 +104,12 @@ const char* HELP_TEXT = R"(Команды:
   /think on|off           показывать рассуждения модели
   /file <путь> [вопрос]   отправить текстовый файл
   /img <путь> [вопрос]    отправить фото (png/jpg/webp/gif)
+  /language ru|en         сменить язык
   /about                  о проекте
   /clear                  очистить диалог
   /help  /exit
 Ctrl+C прерывает ответ.)";
+}
 
 struct Provider {
     std::string base_url;
@@ -99,7 +121,7 @@ struct Config {
     std::map<std::string, Provider> providers;
     std::string active_provider;
     std::string active_model;
-    std::string system_prompt = "Ты помощник по программированию. Отвечай кратко и по делу.";
+    std::string system_prompt = "";
 };
 
 Config load_config() {
@@ -123,9 +145,11 @@ Config load_config() {
                 cfg.active_provider = j["active"].value("provider", "");
                 cfg.active_model = j["active"].value("model", "");
             }
-            cfg.system_prompt = j.value("system", cfg.system_prompt);
+            cfg.system_prompt = j.value("system", "");
+            lang = j.value("lang", 0);
+            if (cfg.system_prompt.empty()) cfg.system_prompt = lang ? "You are a coding assistant. Be concise." : "Ты помощник по программированию. Отвечай кратко и по делу.";
         } catch (...) {
-            std::cerr << red("Ошибка чтения конфига") << "\n";
+            std::cerr << red(L("Ошибка чтения конфига", "Config read error")) << "\n";
         }
     }
     return cfg;
@@ -140,6 +164,7 @@ void save_config(const Config& cfg) {
     }
     j["active"] = {{"provider", cfg.active_provider}, {"model", cfg.active_model}};
     j["system"] = cfg.system_prompt;
+    j["lang"] = lang;
     std::ofstream f(conf_file());
     f << j.dump(2);
     fs::permissions(conf_file(), fs::perms::owner_read | fs::perms::owner_write);
@@ -231,7 +256,7 @@ CurlResponse http_get(const std::string& url, const std::string& key) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.2-cpp");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status);
@@ -253,7 +278,7 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.2-cpp");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     StreamState st{on_chunk, "", show_think};
@@ -295,7 +320,7 @@ int choose_item(const std::vector<std::string>& items, const std::string& curren
         std::string mark = (items[i] == current) ? green("●") : " ";
         std::cout << " " << mark << " " << (i + 1) << ". " << items[i] << "\n";
     }
-    std::cout << dim("номер (Enter - отмена): ");
+    std::cout << dim(L("номер (Enter - отмена): ", "number (Enter - cancel): "));
     std::string ans;
     std::getline(std::cin, ans);
     int n = 0;
@@ -309,7 +334,7 @@ void cmd_send(Config& cfg, const std::string& text,
               const json& extra_content = json()) {
     Provider* p = active_provider(cfg);
     if (!p || cfg.active_model.empty()) {
-        std::cerr << red("Не выбран провайдер/модель") << "\n";
+        std::cerr << red(L("Не выбран провайдер/модель", "No provider/model selected")) << "\n";
         return;
     }
     json user_msg;
@@ -339,7 +364,7 @@ void cmd_send(Config& cfg, const std::string& text,
     bool ok = chat_stream_curl(url, key, payload, show_think,
         [&](const std::string& kind, const std::string& piece) {
             if (kind == "think") {
-                if (!thinking) { std::cout << dim("┌ рассуждает\n"); thinking = true; }
+                if (!thinking) { std::cout << dim(L("┌ рассуждает\n", "┌ thinking\n")); thinking = true; }
                 std::cout << dim(piece);
             } else {
                 if (thinking) { std::cout << "\n\n"; thinking = false; }
@@ -351,7 +376,7 @@ void cmd_send(Config& cfg, const std::string& text,
 
     std::cout << "\n";
     if (!ok) {
-        std::cerr << red("Ошибка сети") << "\n";
+        std::cerr << red(L("Ошибка сети", "Network error")) << "\n";
         messages.pop_back();
         return;
     }
@@ -431,27 +456,24 @@ bool handle_command(Config& cfg, const std::string& line,
     if (cmd == "exit" || cmd == "quit" || cmd == "q") return false;
 
     if (cmd == "help") {
-        std::cout << HELP_TEXT << "\n";
+        std::cout << help_text() << "\n";
     } else if (cmd == "about") {
-        std::string txt = ABOUT_TEXT;
-        size_t pos = txt.find("{version}");
-        if (pos != std::string::npos) txt.replace(pos, 9, VERSION);
-        std::cout << txt << "\n";
+        std::cout << about_text() << "\n";
     } else if (cmd == "providers") {
-        if (cfg.providers.empty()) { std::cout << dim("Пусто. Добавь: /addprovider deepseek\n"); return true; }
+        if (cfg.providers.empty()) { std::cout << dim(L("Пусто. Добавь: /addprovider deepseek\n", "Empty. Add: /addprovider deepseek\n")); return true; }
         for (auto& [n, p] : cfg.providers) {
             std::string mark = (n == cfg.active_provider) ? green("●") : " ";
             std::string k = get_key(n, p).empty() ? red("нет ключа") : green("ключ есть");
             std::cout << " " << mark << " " << n << "  " << dim(p.base_url) << "  " << k << "\n";
         }
     } else if (cmd == "provider") {
-        if (cfg.providers.empty()) { std::cout << dim("Пусто.\n"); return true; }
+        if (cfg.providers.empty()) { std::cout << dim(L("Пусто.\n", "Empty.\n")); return true; }
         if (!arg.empty() && cfg.providers.count(arg)) {
             cfg.active_provider = arg;
             auto* p = active_provider(cfg);
             if (p && !p->models.empty()) cfg.active_model = p->models[0];
             save_config(cfg);
-            std::cout << green("Провайдер: " + cfg.active_provider + ", модель: " + cfg.active_model) << "\n";
+            std::cout << green(L("Провайдер: ", "Provider: ") + cfg.active_provider + ", " + L("модель: ", "model: ") + cfg.active_model) << "\n";
         } else {
             std::vector<std::string> names;
             for (auto& [n, _] : cfg.providers) names.push_back(n);
@@ -461,41 +483,41 @@ bool handle_command(Config& cfg, const std::string& line,
                 auto* p = active_provider(cfg);
                 if (p && !p->models.empty()) cfg.active_model = p->models[0];
                 save_config(cfg);
-                std::cout << green("Провайдер: " + cfg.active_provider) << "\n";
+                std::cout << green(L("Провайдер: ", "Provider: ") + cfg.active_provider) << "\n";
             }
         }
     } else if (cmd == "models") {
         auto* p = active_provider(cfg);
-        if (!p) { std::cerr << red("Нет активного провайдера\n"); return true; }
-        std::vector<std::string> ms = p->models.empty() ? std::vector<std::string>{dim("(пусто, /fetchmodels)")} : p->models;
+        if (!p) { std::cerr << red(L("Нет активного провайдера\n", "No active provider\n")); return true; }
+        std::vector<std::string> ms = p->models.empty() ? std::vector<std::string>{dim(L("(пусто, /fetchmodels)", "(empty, /fetchmodels)"))} : p->models;
         choose_item(ms, cfg.active_model);
     } else if (cmd == "model") {
         auto* p = active_provider(cfg);
-        if (!p) { std::cerr << red("Нет активного провайдера\n"); return true; }
+        if (!p) { std::cerr << red(L("Нет активного провайдера\n", "No active provider\n")); return true; }
         if (!arg.empty()) {
             cfg.active_model = arg;
             if (std::find(p->models.begin(), p->models.end(), arg) == p->models.end())
                 p->models.push_back(arg);
             save_config(cfg);
-            std::cout << green("Модель: " + arg) << "\n";
+            std::cout << green(L("Модель: ", "Model: ") + arg) << "\n";
         } else {
             int idx = choose_item(p->models, cfg.active_model);
-            if (idx >= 0) { cfg.active_model = p->models[idx]; save_config(cfg); std::cout << green("Модель: " + cfg.active_model) << "\n"; }
+            if (idx >= 0) { cfg.active_model = p->models[idx]; save_config(cfg); std::cout << green(L("Модель: ", "Model: ") + cfg.active_model) << "\n"; }
         }
     } else if (cmd == "fetchmodels") {
         auto* p = active_provider(cfg);
-        if (!p) { std::cerr << red("Нет активного провайдера\n"); return true; }
+        if (!p) { std::cerr << red(L("Нет активного провайдера\n", "No active provider\n")); return true; }
         auto ids = fetch_models(cfg.active_provider, *p);
-        if (!ids.empty()) { p->models = ids; save_config(cfg); std::cout << green("Моделей: " + std::to_string(ids.size())) << "\n"; }
+        if (!ids.empty()) { p->models = ids; save_config(cfg); std::cout << green(L("Моделей: ", "Models: ") + std::to_string(ids.size())) << "\n"; }
     } else if (cmd == "addprovider") {
         std::string name = arg;
-        if (name.empty()) { std::cout << "Имя: "; std::getline(std::cin, name); }
+        if (name.empty()) { std::cout << L("Имя: ", "Name: "); std::getline(std::cin, name); }
         if (name.empty()) return true;
         std::cout << "base_url: ";
         std::string url; std::getline(std::cin, url);
-        if (url.empty()) { std::cerr << red("base_url обязателен\n"); return true; }
+        if (url.empty()) { std::cerr << red(L("base_url обязателен\n", "base_url required\n")); return true; }
         while (!url.empty() && url.back() == '/') url.pop_back();
-        std::string key = getpass_cpp("API-ключ (скрыт): ");
+        std::string key = getpass_cpp(L("API-ключ (скрыт): ", "API key (hidden): "));
         Provider p; p.base_url = url; p.key = key;
         cfg.providers[name] = p;
         auto ids = fetch_models(name, p);
@@ -503,71 +525,83 @@ bool handle_command(Config& cfg, const std::string& line,
         cfg.providers[name] = p;
         save_config(cfg);
         if (cfg.active_provider.empty()) { cfg.active_provider = name; if (!ids.empty()) cfg.active_model = ids[0]; save_config(cfg); }
-        std::cout << green("Добавлен: " + name) << "\n";
+        std::cout << green(L("Добавлен: ", "Added: ") + name) << "\n";
     } else if (cmd == "delprovider") {
         if (cfg.providers.erase(arg)) {
             if (cfg.active_provider == arg) { cfg.active_provider.clear(); cfg.active_model.clear(); }
             save_config(cfg);
-            std::cout << green("Удалён: " + arg) << "\n";
-        } else std::cerr << red("Нет такого\n");
+            std::cout << green(L("Удалён: ", "Removed: ") + arg) << "\n";
+        } else std::cerr << red(L("Нет такого\n", "Not found\n"));
     } else if (cmd == "key") {
         std::string name = arg.empty() ? cfg.active_provider : arg;
-        if (!cfg.providers.count(name)) { std::cerr << red("Нет такого\n"); return true; }
-        cfg.providers[name].key = getpass_cpp("Новый ключ: ");
+        if (!cfg.providers.count(name)) { std::cerr << red(L("Нет такого\n", "Not found\n")); return true; }
+        cfg.providers[name].key = getpass_cpp(L("Новый ключ: ", "New key: "));
         save_config(cfg);
-        std::cout << green("Сохранён") << "\n";
+        std::cout << green(L("Сохранён", "Saved")) << "\n";
     } else if (cmd == "system") {
         if (arg.empty()) std::cout << dim(cfg.system_prompt) << "\n";
-        else { cfg.system_prompt = arg; save_config(cfg); std::cout << green("Обновлён") << "\n"; }
+        else { cfg.system_prompt = arg; save_config(cfg); std::cout << green(L("Обновлён", "Updated")) << "\n"; }
     } else if (cmd == "think") {
         show_think = (arg != "off");
-        std::cout << dim(show_think ? "Рассуждения: показываю" : "Рассуждения: скрыты") << "\n";
+        std::cout << dim(show_think ? L("Рассуждения: показываю", "Reasoning: shown") : L("Рассуждения: скрыты", "Reasoning: hidden")) << "\n";
     } else if (cmd == "clear") {
         messages.clear();
-        std::cout << dim("Диалог очищен") << "\n";
+        std::cout << dim(L("Диалог очищен", "Chat cleared")) << "\n";
     } else if (cmd == "file") {
         auto [path, question] = split_cmd_arg(arg);
-        if (path.empty()) { std::cerr << red("Укажи путь: /file <файл> [вопрос]\n"); return true; }
+        if (path.empty()) { std::cerr << red(L("Укажи путь: /file <файл> [вопрос]\n", "Usage: /file <path> [question]\n")); return true; }
         fs::path fp(path);
         std::string ext = fp.extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        if (is_image_ext(ext)) { std::cerr << red("Это фото. Используй /img\n"); return true; }
-        if (!fs::exists(fp)) { std::cerr << red("Файл не найден: " + path) << "\n"; return true; }
+        if (is_image_ext(ext)) { std::cerr << red(L("Это фото. Используй /img\n", "This is an image. Use /img\n")); return true; }
+        if (!fs::exists(fp)) { std::cerr << red(L("Файл не найден: ", "File not found: ") + path) << "\n"; return true; }
         std::ifstream f(fp);
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         if (content.size() > 120000) content = content.substr(0, 120000) + "\n...[обрезан]";
-        std::string text = "[Файл: " + fp.filename().string() + "]\n```\n" + content + "\n```\n\n" + (question.empty() ? "Опиши содержимое" : question);
-        std::cout << dim("Отправляю файл " + fp.filename().string() + " ...") << "\n";
+        std::string text = "[Файл: " + fp.filename().string() + "]\n```\n" + content + "\n```\n\n" + (question.empty() ? L("Опиши содержимое", "Describe the contents") : question);
+        std::cout << dim(L("Отправляю файл ", "Sending file ") + fp.filename().string() + " ...") << "\n";
         cmd_send(cfg, text, messages, show_think);
     } else if (cmd == "img") {
         auto [path, question] = split_cmd_arg(arg);
-        if (path.empty()) { std::cerr << red("Укажи путь: /img <фото> [вопрос]\n"); return true; }
+        if (path.empty()) { std::cerr << red(L("Укажи путь: /img <фото> [вопрос]\n", "Usage: /img <path> [question]\n")); return true; }
         fs::path fp(path);
         std::string ext = fp.extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        if (!is_image_ext(ext)) { std::cerr << red("Не похоже на фото (" + ext + "). Поддерживаются: png, jpg, webp, gif. Для текста: /file\n"); return true; }
-        if (!fs::exists(fp)) { std::cerr << red("Файл не найден: " + path) << "\n"; return true; }
+        if (!is_image_ext(ext)) { std::cerr << red(L("Не похоже на фото (" + ext + "). Форматы: png, jpg, webp, gif. Для текста: /file\n", "Not an image (" + ext + "). Supported: png, jpg, webp, gif. For text: /file\n")); return true; }
+        if (!fs::exists(fp)) { std::cerr << red(L("Файл не найден: ", "File not found: ") + path) << "\n"; return true; }
         auto sz = fs::file_size(fp);
-        if (sz > 10 * 1024 * 1024) { std::cerr << red("Фото слишком большое (>10MB)\n"); return true; }
+        if (sz > 10 * 1024 * 1024) { std::cerr << red(L("Фото слишком большое (>10MB)\n", "Image too large (>10MB)\n")); return true; }
         std::ifstream f(fp, std::ios::binary);
         std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         std::string b64 = base64_encode(data);
         std::string mime = mime_type(ext);
         std::string data_uri = "data:" + mime + ";base64," + b64;
         json content = json::array({
-            {{"type", "text"}, {"text", question.empty() ? "Опиши что на фото" : question}},
+            {{"type", "text"}, {"text", question.empty() ? L("Опиши что на фото", "Describe this image") : question}},
             {{"type", "image_url"}, {"image_url", {{"url", data_uri}}}}
         });
-        std::cout << dim("Отправляю фото " + fp.filename().string() + " ...") << "\n";
+        std::cout << dim(L("Отправляю фото ", "Sending image ") + fp.filename().string() + " ...") << "\n";
         if (cfg.active_model.find("gpt-4o") == std::string::npos &&
             cfg.active_model.find("gemini") == std::string::npos &&
             cfg.active_model.find("claude") == std::string::npos &&
             cfg.active_model.find("vision") == std::string::npos) {
-            std::cout << yellow("Внимание: модель '" + cfg.active_model + "' возможно не поддерживает фото.") << "\n";
+            std::cout << yellow(L("Внимание: модель '", "Warning: model '") + cfg.active_model + L("' возможно не поддерживает фото.", "' may not support images.")) << "\n";
         }
         cmd_send(cfg, "", messages, show_think, content);
+    } else if (cmd == "language" || cmd == "lang") {
+        if (arg == "en" || arg == "english") {
+            lang = 1;
+            save_config(cfg);
+            std::cout << dim("Language: English") << "\n";
+        } else if (arg == "ru" || arg == "russian") {
+            lang = 0;
+            save_config(cfg);
+            std::cout << dim("Язык: русский") << "\n";
+        } else {
+            std::cout << dim(lang ? "Current: English. Use: /language ru|en" : "Текущий: русский. Использование: /language ru|en") << "\n";
+        }
     } else {
-        std::cerr << red("Неизвестная команда /" + cmd + ". Список: /help") << "\n";
+        std::cerr << red(L("Неизвестная команда /" + cmd + ". Список: /help", "Unknown command /" + cmd + ". See: /help")) << "\n";
     }
     return true;
 }
@@ -578,7 +612,7 @@ int main() {
     fs::create_directories(conf_dir());
 
     std::cout << cyan(BANNER) << "\n";
-    std::cout << dim("  v" + VERSION + "  ·  /help - команды  ·  Ctrl+C - прервать\n\n");
+    std::cout << dim("  v" + VERSION + "  ·  /help  ·  Ctrl+C\n\n");
 
     std::vector<json> messages;
     bool show_think = true;
