@@ -17,7 +17,7 @@ jobs:
         run: g++ -std=c++17 -O2 $(pkg-config --cflags libcurl) -o kinecode-linux kinecode.cpp $(pkg-config --libs libcurl) -lreadline
       - name: smoke test (tls)
         run: |
-          printf '/addprovider t\nhttps://api.github.com/nonexistent\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode-linux > out.txt || true
+          printf '/addprovider t\nhttps://api.github.com/nonexistent\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode-linux > out.txt 2>&1 || true
           cat out.txt
           grep -qE "HTTP 40[134]" out.txt
       - uses: actions/upload-artifact@v4
@@ -49,7 +49,7 @@ jobs:
           fi
       - name: smoke test (tls via native ca)
         run: |
-          printf '/addprovider t\nhttps://api.github.com/nonexistent\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode.exe > out.txt || true
+          printf '/addprovider t\nhttps://api.github.com/nonexistent\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode.exe > out.txt 2>&1 || true
           cat out.txt
           grep -qE "HTTP 40[134]" out.txt
       - uses: actions/upload-artifact@v4
