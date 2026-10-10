@@ -17,10 +17,26 @@ ______  _____ _____ ___________ _____
 
 Grab a ready binary from the [Releases](https://github.com/fawwelll/kinecode/releases) page — no compiler needed.
 
-### Linux
+### Linux — one line
 
-1. Download **`kinecode-linux`** (works on Debian, Ubuntu, Arch, Fedora — any x86_64 distro)
-2. A downloaded file is not executable by default — this is standard Linux behavior, not a bug. Give it permission and run:
+```bash
+curl -fsSL https://raw.githubusercontent.com/fawwelll/kinecode/main/install.sh | sh
+```
+
+The installer downloads the binary, makes it executable and puts it in `~/.local/bin/kinecode` (already in PATH on most distros). Then just type `kinecode`.
+
+### Linux — AppImage (double-click)
+
+Download **`kinecode-x86_64.AppImage`** — all libraries are bundled, it opens on almost any distro (Debian, Ubuntu, Arch, Fedora, Mint, ...). In Dolphin/Nautilus double-clicking it offers *"Run"* — no chmod, no terminal needed. From a terminal:
+
+```bash
+chmod +x kinecode-x86_64.AppImage
+./kinecode-x86_64.AppImage
+```
+
+### Linux — plain binary
+
+Download **`kinecode-linux`** (Debian, Ubuntu, Arch, Fedora — any x86_64 distro). A downloaded file is not executable by default — this is standard Linux behavior, not a bug:
 
 ```bash
 cd ~/Downloads                      # or wherever you saved it
@@ -28,14 +44,13 @@ chmod +x kinecode-linux               # allow executing the file
 ./kinecode-linux                      # run it
 ```
 
-3. *(Optional)* Install it as a proper command, available everywhere:
+*(Optional)* Install as a proper command:
 
 ```bash
-mkdir -p ~/.local/bin
-mv kinecode-linux ~/.local/bin/kinecode
+mkdir -p ~/.local/bin && mv kinecode-linux ~/.local/bin/kinecode
 ```
 
-`~/.local/bin` is already in PATH on most distros — after this, just type `kinecode` in any terminal. If you also grabbed `kinecode.desktop` from the repo, it will work now too (right-click → *Add to favorites* / move it to the desktop).
+`~/.local/bin` is already in PATH on most distros — after this, just type `kinecode` in any terminal. If you also grabbed `kinecode.desktop` from the repo, it will work now too.
 
 ### Windows
 
