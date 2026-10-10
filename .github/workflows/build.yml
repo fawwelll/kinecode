@@ -17,9 +17,9 @@ jobs:
         run: g++ -std=c++17 -O2 $(pkg-config --cflags libcurl) -o kinecode-linux kinecode.cpp $(pkg-config --libs libcurl) -lreadline
       - name: smoke test (tls)
         run: |
-          printf '/addprovider t\nhttps://api.deepseek.com/v1\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode-linux > out.txt || true
+          printf '/addprovider t\nhttps://api.github.com/nonexistent\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode-linux > out.txt || true
           cat out.txt
-          grep -q "HTTP 401" out.txt
+          grep -qE "HTTP 40[134]" out.txt
       - uses: actions/upload-artifact@v4
         with:
           name: kinecode-linux
@@ -49,16 +49,49 @@ jobs:
           fi
       - name: smoke test (tls via native ca)
         run: |
-          printf '/addprovider t\nhttps://api.deepseek.com/v1\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode.exe > out.txt || true
+          printf '/addprovider t\nhttps://api.github.com/nonexistent\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode.exe > out.txt || true
           cat out.txt
-          grep -q "HTTP 401" out.txt
+          grep -qE "HTTP 40[134]" out.txt
       - uses: actions/upload-artifact@v4
         with:
           name: kinecode-windows
           path: kinecode.exe
 
+  windows-sign:
+    needs: windows
+    runs-on: ubuntu-latest
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kinecode-windows
+          path: .
+      - name: sign via SignPath
+        if: env.SIGNPATH_API_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-url: 'https://signpath.io/api/v1'
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'kinecode'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-file: 'signpath/artifact-configuration.xml'
+          input-artifact-path: 'kinecode.exe'
+          output-artifact-directory: 'signed'
+          wait-for-completion: true
+      - name: upload signed exe
+        if: env.SIGNPATH_API_TOKEN != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kinecode-windows-signed
+          path: signed/kinecode.exe
+
   release:
-    needs: [linux, windows]
+    needs: [linux, windows, windows-sign]
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -69,10 +102,22 @@ jobs:
           path: .
       - uses: actions/download-artifact@v4
         with:
+          name: kinecode-windows-signed
+          path: signed-win/
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
           name: kinecode-windows
-          path: .
-      - name: make executable
-        run: chmod +x kinecode-linux
+          path: unsigned-win/
+      - name: pick exe (signed if available)
+        run: |
+          if [ -f signed-win/kinecode.exe ]; then
+            cp signed-win/kinecode.exe kinecode.exe
+            echo "using SIGNED exe"
+          else
+            cp unsigned-win/kinecode.exe kinecode.exe
+            echo "using UNSIGNED exe"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: |
