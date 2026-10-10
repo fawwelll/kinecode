@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <set>
 #if defined(_WIN32) || defined(__MINGW32__)
 #include <windows.h>
 #include <conio.h>
@@ -31,7 +32,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.4.1";
+const std::string VERSION = "0.5";
 
 int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
@@ -142,6 +143,8 @@ struct Config {
     std::string active_provider;
     std::string active_model;
     std::string system_prompt = "";
+    std::string mode = "folder";
+    std::string workdir;
 };
 
 Config load_config() {
@@ -167,6 +170,8 @@ Config load_config() {
             }
             cfg.system_prompt = j.value("system", "");
             lang = j.value("lang", 0);
+            cfg.mode = j.value("mode", "folder");
+            cfg.workdir = j.value("workdir", "");
             if (cfg.system_prompt.empty()) cfg.system_prompt = lang ? "You are a coding assistant. Be concise." : "Ты помощник по программированию. Отвечай кратко и по делу.";
         } catch (...) {
             std::cerr << red(L("Ошибка чтения конфига", "Config read error")) << "\n";
@@ -176,7 +181,17 @@ Config load_config() {
 }
 
 void save_config(const Config& cfg) {
-    try { fs::create_directories(conf_dir()); } catch (...) {}
+    try {
+        fs::create_directories(conf_dir());
+        fs::path plugDir = conf_dir() / "plugins";
+        fs::create_directories(plugDir);
+        fs::path ex = plugDir / "review.md";
+        if (!fs::exists(ex)) {
+            std::ofstream of(ex);
+            of << L("Проведи код-ревью: найди баги, проблемы безопасности и стиля, предложи улучшения.\n\nКод:\n",
+                    "Do a code review: find bugs, security and style issues, suggest improvements.\n\nCode:\n");
+        }
+    } catch (...) {}
     json j;
     j["providers"] = json::object();
     for (auto& [k, p] : cfg.providers) {
@@ -185,6 +200,8 @@ void save_config(const Config& cfg) {
     j["active"] = {{"provider", cfg.active_provider}, {"model", cfg.active_model}};
     j["system"] = cfg.system_prompt;
     j["lang"] = lang;
+    j["mode"] = cfg.mode;
+    j["workdir"] = cfg.workdir;
     std::ofstream f(conf_file());
     f << j.dump(2);
     #ifndef _WIN32
@@ -231,11 +248,15 @@ std::string getpass_cpp(const std::string& prompt) {
     return pass;
 }
 
-// ---------- TUI ----------
+// ---------- TUI (opencode-style) ----------
 
 volatile bool g_interrupt = false;
 std::string g_status;
 bool tui_mask = false;
+long g_ctx_tokens = 0;
+
+struct Usage { bool got = false; long prompt = 0, completion = 0; };
+Usage g_usage;
 
 enum { K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_DEL, K_IGNORE };
 
@@ -282,21 +303,62 @@ static void wraw(const std::string& s) {
     if (!s.empty()) { fwrite(s.data(), 1, s.size(), stdout); fflush(stdout); }
 }
 
+const std::map<std::string, std::pair<std::string, std::string>> PRESETS = {
+    {"deepseek",    {"https://api.deepseek.com/v1", "DeepSeek"}},
+    {"groq",        {"https://api.groq.com/openai/v1", "Groq"}},
+    {"openrouter",  {"https://openrouter.ai/api/v1", "OpenRouter"}},
+    {"nvidia",      {"https://integrate.api.nvidia.com/v1", "NVIDIA NIM"}},
+    {"google",      {"https://generativelanguage.googleapis.com/v1beta/openai", "Google Gemini"}},
+};
+
+static std::string fmtDur(double s) {
+    char b[32];
+    if (s < 10) snprintf(b, 32, "%.1fs", s); else snprintf(b, 32, "%.0fs", s);
+    return b;
+}
+static std::string fmtTps(double t) {
+    char b[32];
+    snprintf(b, 32, "%.1f tok/s", t);
+    return b;
+}
+
+enum class MsgKind { User, Assistant, Info, Error, Meta };
+struct Msg { MsgKind kind; std::string text; Msg(MsgKind k, const std::string& t) : kind(k), text(t) {} };
+
+std::vector<std::string> fetch_models(const std::string& name, const Provider& p);
+
 struct Tui {
     bool active = false;
     int rows = 24, cols = 80;
-    std::vector<std::string> log;
-    std::string partial;
-    std::string input;
+    std::vector<Msg> msgs;
     std::vector<std::string> history;
     int hist_idx = 0;
+    std::string input;
+    std::string sessionTitle;
     std::chrono::steady_clock::time_point last_draw;
 
+    bool palOpen = false;
+    std::string palFilter;
+    int palSel = 0;
+    bool setOpen = false;
+    int setSel = 0, setModelSel = 0;
+    int setPage = 0; // 0=провайдеры, 1=модели
+    std::string statusMsg;
+    std::string providerPage;
+    bool dlgOpen = false;
+    std::string dlgTitle, dlgValue;
+    bool dlgMask = false;
+    Config* pCfg = nullptr;
+
+    void addMsg(MsgKind k, const std::string& t) {
+        msgs.push_back(Msg(k, t));
+        maybe_draw();
+    }
+    void beginStream() { msgs.push_back(Msg(MsgKind::Assistant, "")); }
     void feed(const std::string& s) {
-        for (char ch : s) {
-            if (ch == '\n') { log.push_back(partial); partial.clear(); }
-            else partial += ch;
-        }
+        if (msgs.empty() || msgs.back().kind != MsgKind::Assistant)
+            msgs.push_back(Msg(MsgKind::Info, ""));
+        msgs.back().text += s;
         maybe_draw();
     }
     void maybe_draw() {
@@ -305,67 +367,6 @@ struct Tui {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_draw).count() < 30) return;
         last_draw = now;
         draw();
-    }
-    void flush_partial() { if (!partial.empty()) { log.push_back(partial); partial.clear(); } }
-
-    std::vector<std::string> build_header() {
-        std::vector<std::string> h;
-        std::vector<std::string> lines;
-        std::string b = BANNER;
-        size_t pos = 0;
-        while (pos <= b.size()) {
-            size_t nl = b.find('\n', pos);
-            if (nl == std::string::npos) { if (pos < b.size()) lines.push_back(b.substr(pos)); break; }
-            lines.push_back(b.substr(pos, nl - pos));
-            pos = nl + 1;
-        }
-        while (!lines.empty() && lines.back().find_first_not_of(" ") == std::string::npos) lines.pop_back();
-        while (!lines.empty() && lines.front().find_first_not_of(" ") == std::string::npos) lines.erase(lines.begin());
-        if (cols >= 62 && rows >= 24) {
-            for (size_t i = 0; i < lines.size(); i++) {
-                if (i < 6) h.push_back(paint("38;5;208", lines[i]));
-                else h.push_back(dim(lines[i]));
-            }
-        } else if (cols >= 24) {
-            h.push_back(paint("38;5;208", " ______  _____ _____ ___________ _____"));
-            h.push_back(paint("38;5;208", "|  _  \\/  ___/  __ \\  _  |  _  \\  ___|"));
-            h.push_back(dim(" kinecode"));
-        } else {
-            h.push_back(paint("38;5;208", "kinecode"));
-        }
-        h.push_back(dim(" " + g_status));
-        return h;
-    }
-
-    void draw() {
-        if (!active) return;
-        tui_size(rows, cols);
-        if (cols < 20 || rows < 6) return;
-        auto header = build_header();
-        int body = rows - (int)header.size() - 3;
-        if (body < 1) body = 1;
-
-        std::vector<std::string> all = log;
-        if (!partial.empty()) all.push_back(partial);
-        std::vector<std::string> rowsv;
-        for (auto& l : all) for (auto& r : wrap_ansi(l, cols - 1)) rowsv.push_back(r);
-
-        std::string f = "\033[H";
-        for (auto& h : header) f += h + "\033[K\r\n";
-        int start = (int)rowsv.size() > body ? (int)rowsv.size() - body : 0;
-        int used = 0;
-        for (int i = start; i < (int)rowsv.size() && used < body; i++, used++)
-            f += rowsv[i] + "\033[K\r\n";
-        for (; used < body; used++) f += "\033[K\r\n";
-        std::string sep;
-        for (int i = 0; i < cols - 2 && i < 200; i++) sep += "─";
-        f += dim(sep) + "\033[K\r\n";
-        std::string shown;
-        if (tui_mask) shown.assign(utf8_len(input), '*'); else shown = input;
-        f += paint("38;5;208", " ❯ ") + shown + "\033[K\r\n";
-        f += dim(" /help · Ctrl+C " + std::string(L("- прервать", "- interrupt")) + " · /exit") + "\033[K";
-        f += "\033[J";
-        wraw(f);
     }
 
     static size_t utf8_len(const std::string& s) {
@@ -407,6 +408,454 @@ struct Tui {
         }
         out.push_back(cur);
         return out;
+    }
+
+    int sidebarW() const { return (cols >= 112) ? 28 : 0; }
+    int contentW() const { return cols - sidebarW() - 2; }
+
+    std::vector<std::string> blockRows(const Msg& m, int width) {
+        std::vector<std::string> rows;
+        if (m.kind == MsgKind::Meta || m.kind == MsgKind::Info) {
+            for (auto& r : wrap_ansi(dim(m.text), width)) rows.push_back(" " + r);
+            rows.push_back("");
+            return rows;
+        }
+        if (m.kind == MsgKind::Error) {
+            for (auto& r : wrap_ansi("\033[31m" + m.text + "\033[0m", width)) rows.push_back(" " + r);
+            rows.push_back("");
+            return rows;
+        }
+        std::string bar = (m.kind == MsgKind::User) ? paint("38;5;208", "▌") : dim("▌");
+        for (auto& r : wrap_ansi(m.text, width - 2)) rows.push_back(bar + " " + r);
+        rows.push_back("");
+        return rows;
+    }
+
+    void draw_splash() {
+        std::vector<std::string> art;
+        art.push_back(paint("38;5;208", "______  _____ _____ ___________ _____"));
+        art.push_back(paint("38;5;208", "|  _  \\/  ___/  __ \\  _  |  _  \\  ___|"));
+        art.push_back(paint("38;5;208", "| | | |\\ `--.| /  \\/ | | | | | | |__"));
+        art.push_back(paint("38;5;208", "| | | | `--. \\ |   | | | | | | |  __|"));
+        art.push_back(paint("38;5;208", "| |/ / /\\__/ / \\__/\\ \\_/ / |/ /| |___"));
+        art.push_back(paint("38;5;208", "|___/  \\____/ \\____/\\___/|___/ \\____/"));
+        art.push_back("");
+        art.push_back(dim(" _   _   ___  ______ _   _  _____ _____ _____"));
+        art.push_back(dim("| | | | / _ \\ | ___ \\ \\ | ||  ___/  ___/  ___|"));
+        art.push_back(dim("| |_| |/ /_\\ \\| |_/ /  \\| || |__ \\ `--.\\ `--."));
+        art.push_back(dim("|  _  ||  _  ||    /| . ` ||  __| `--. \\`--. \\"));
+        art.push_back(dim("| | | || | | || |\\ \\| |\\  || |___/\\__/ /\\__/ /"));
+        art.push_back(dim("\\_| |_/\\_| |_/\\_| \\_\\_| \\_/\\____/\\____/\\____/"));
+
+        int boxW = cols < 60 ? cols - 4 : 58;
+        int totalH = (int)art.size() + 2 + 3 + 2;
+        int top = (rows - totalH) / 2; if (top < 1) top = 1;
+        std::string f = "\033[H\033[2J";
+        for (auto& a : art) {
+            long alen = (long)utf8_len(a);
+            int pad = (cols - (int)alen) / 2; if (pad < 0) pad = 0;
+            f += "\033[" + std::to_string(top++) + ";1H" + std::string(pad, ' ') + a;
+        }
+        top++;
+        int x0 = (cols - boxW) / 2; if (x0 < 1) x0 = 1;
+        std::string inner = input;
+        if (inner.empty() && !tui_mask) inner = dim(L(" Спроси что угодно… '/help'", " Ask anything… '/help'"));
+        std::string border; for (int i = 0; i < boxW - 2; i++) border += "─";
+        std::string padIn = inner;
+        while (utf8_len(padIn) < (size_t)boxW - 4) padIn += " ";
+        f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+        f += "\033[" + std::to_string(top + 1) + ";" + std::to_string(x0) + "H" + dim("│") + padIn + dim("│");
+        f += "\033[" + std::to_string(top + 2) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+        top += 4;
+        std::string st = " Chat · " + g_status;
+        int pad = (cols - (int)utf8_len(st)) / 2; if (pad < 0) pad = 0;
+        f += "\033[" + std::to_string(top) + ";1H" + std::string(pad, ' ') + dim(st);
+        if (g_status.find("—/—") != std::string::npos) {
+            top++;
+            std::string hint = L(" Настрой провайдера: ctrl+p → /settings", " Set up a provider: ctrl+p → /settings");
+            pad = (cols - (int)utf8_len(hint)) / 2; if (pad < 0) pad = 0;
+            f += "\033[" + std::to_string(top) + ";1H" + std::string(pad, ' ') + paint("38;5;208", hint);
+        }
+        f += "\033[" + std::to_string(rows) + ";1H" + dim(" " + footerText());
+        f += "\033[J";
+        wraw(f);
+    }
+
+    std::string footerText() {
+        return L("/help · ctrl+p команды · ctrl+c прервать · /exit",
+                 "/help · ctrl+p commands · ctrl+c interrupt · /exit");
+    }
+
+    void draw_input_box(std::string& f, int y_top, int width, const std::string& placeholder) {
+        std::string inner = input;
+        if (inner.empty() && !tui_mask) inner = dim(placeholder);
+        std::string border; for (int i = 0; i < width - 2; i++) border += "─";
+        std::string pad = inner;
+        while (utf8_len(pad) < (size_t)width - 4) pad += " ";
+        f += "\033[" + std::to_string(y_top) + ";1H" + dim("╭" + border + "╮");
+        f += "\033[" + std::to_string(y_top + 1) + ";1H" + dim("│") + " " + pad + dim("│");
+        f += "\033[" + std::to_string(y_top + 2) + ";1H" + dim("╰" + border + "╯");
+    }
+
+    void draw_chat() {
+        int sw = sidebarW();
+        int cw = contentW();
+        int bodyRows = rows - 1 - 4 - 1;
+        if (bodyRows < 1) bodyRows = 1;
+
+        std::vector<std::string> rowsv;
+        for (auto& m : msgs) for (auto& r : blockRows(m, cw)) rowsv.push_back(r);
+
+        std::string f = "\033[H\033[2J";
+        f += "\033[1;1H " + paint("1", "kinecode") + dim("  ·  " + g_status) + "\033[K";
+        int start = (int)rowsv.size() > bodyRows ? (int)rowsv.size() - bodyRows : 0;
+        int y = 2, used = 0;
+        for (int i = start; i < (int)rowsv.size() && used < bodyRows; i++, y++, used++) {
+            f += "\033[" + std::to_string(y) + ";1H" + rowsv[i] + "\033[K";
+        }
+        for (; used < bodyRows; used++, y++) f += "\033[" + std::to_string(y) + ";1H\033[K";
+
+        draw_input_box(f, rows - 4, cw, L(" Спроси что угодно… '/help'", " Ask anything… '/help'"));
+        f += "\033[" + std::to_string(rows) + ";1H" + dim(" " + footerText());
+        if (g_ctx_tokens > 0) {
+            char b[32]; snprintf(b, 32, "%ld tok", g_ctx_tokens);
+            f += "\033[" + std::to_string(rows) + ";" + std::to_string(cols - 12) + "H" + dim(b);
+        }
+
+        if (sw > 0) {
+            int x = cols - sw + 1;
+            for (int yy = 1; yy <= rows; yy++)
+                f += "\033[" + std::to_string(yy) + ";" + std::to_string(x) + "H" + dim("│");
+            int sy = 2;
+            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + paint("1", L("Сессия", "Session"));
+            if (!sessionTitle.empty()) {
+                for (auto& t : wrap_ansi(sessionTitle, sw - 4))
+                    f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + dim(t);
+            }
+            sy++;
+            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + paint("1", L("Контекст", "Context"));
+            char b[64];
+            snprintf(b, 64, "%ld %s", g_ctx_tokens, L("токенов", "tokens"));
+            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + b;
+            sy++;
+            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + dim(L("режим: ", "mode: ")) + pCfg->mode;
+        }
+        f += "\033[J";
+        wraw(f);
+    }
+
+    struct PalItem { std::string cmd, desc; };
+    std::vector<PalItem> palItems() {
+        return {
+            {"/help", L("помощь", "help")},
+            {"/settings", L("настройки: провайдеры, ключи, модели", "settings: providers, keys, models")},
+            {"/providers", L("список провайдеров", "list providers")},
+            {"/model", L("выбрать модель", "select model")},
+            {"/fetchmodels", L("обновить модели с сервера", "fetch models from server")},
+            {"/key", L("сменить API-ключ", "change API key")},
+            {"/mode", L("права доступа full|folder|read", "access mode full|folder|read")},
+            {"/cwd", L("рабочая папка агента", "agent workdir")},
+            {"/plugins", L("список плагинов", "list plugins")},
+            {"/system", L("системный промпт", "system prompt")},
+            {"/think", L("рассуждения on|off", "reasoning on|off")},
+            {"/language", L("язык ru|en", "language ru|en")},
+            {"/clear", L("очистить чат", "clear chat")},
+            {"/about", L("о программе", "about")},
+            {"/exit", L("выход", "quit")},
+        };
+    }
+
+    void draw_palette() {
+        auto items = palItems();
+        std::vector<PalItem> list;
+        for (auto& it : items)
+            if (palFilter.empty() || it.cmd.find(palFilter) != std::string::npos || it.desc.find(palFilter) != std::string::npos)
+                list.push_back(it);
+        if (palSel >= (int)list.size()) palSel = (int)list.size() - 1;
+        if (palSel < 0) palSel = 0;
+
+        int w = cols < 60 ? cols - 4 : 56;
+        int shown = rows - 9; if (shown > (int)list.size()) shown = (int)list.size(); if (shown < 1) shown = 1;
+        int h = shown + 5;
+        int top = (rows - h) / 2; if (top < 1) top = 1;
+        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+
+        std::string border; for (int i = 0; i < w - 2; i++) border += "─";
+        std::string f = "\033[H\033[2J";
+        f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+        auto row = [&](int y, const std::string& txt) {
+            std::string p = txt;
+            while (utf8_len(p) < (size_t)w - 4) p += " ";
+            if (utf8_len(p) > (size_t)w - 4) p = p.substr(0, w - 4);
+            f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + dim("│") + p + dim("│");
+        };
+        row(top + 1, paint("1", L(" Команды", " Commands")));
+        row(top + 2, dim(" " + (palFilter.empty() ? L("фильтр…", "filter…") : palFilter)));
+        row(top + 3, dim(" ────────────────────────────"));
+        for (int i = 0; i < shown; i++) {
+            int idx = (palSel / shown) * shown + i;
+            if (idx >= (int)list.size()) break;
+            std::string line = (idx == palSel ? paint("38;5;208", " ❯ ") : "   ") + list[idx].cmd + "  " + dim(list[idx].desc);
+            row(top + 4 + i, line);
+        }
+        f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+        f += "\033[J";
+        wraw(f);
+    }
+
+    std::string run_palette() {
+        palOpen = true; palFilter.clear(); palSel = 0;
+        std::string result;
+        for (;;) {
+            draw();
+            int k = get_key();
+            if (k == -2) continue;
+            if (k == 27) break;
+            if (k == '\r' || k == '\n') {
+                auto items = palItems();
+                std::vector<PalItem> list;
+                for (auto& it : items)
+                    if (palFilter.empty() || it.cmd.find(palFilter) != std::string::npos || it.desc.find(palFilter) != std::string::npos)
+                        list.push_back(it);
+                if (palSel >= 0 && palSel < (int)list.size()) result = list[palSel].cmd;
+                break;
+            }
+            if (k == K_UP) { palSel--; if (palSel < 0) palSel = 0; continue; }
+            if (k == K_DOWN) { palSel++; continue; }
+            if (k == 127 || k == 8) { utf8_pop(palFilter); palSel = 0; continue; }
+            if (k >= 32) { palFilter += (char)k; palSel = 0; continue; }
+        }
+        palOpen = false;
+        return result;
+    }
+
+    std::string run_dialog(const std::string& title, const std::string& seed, bool mask) {
+        dlgOpen = true; dlgTitle = title; dlgValue = seed; dlgMask = mask;
+        std::string result;
+        for (;;) {
+            draw();
+            int k = get_key();
+            if (k == -2) continue;
+            if (k == 27) break;
+            if (k == '\r' || k == '\n') { result = dlgValue; break; }
+            if (k == 127 || k == 8) { utf8_pop(dlgValue); continue; }
+            if (k == 21) { dlgValue.clear(); continue; }
+            if (k >= 32) dlgValue += (char)k;
+        }
+        dlgOpen = false;
+        return result;
+    }
+
+    void draw_dialog() {
+        int w = cols < 60 ? cols - 4 : 56;
+        int top = rows / 2 - 2; if (top < 1) top = 1;
+        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+        std::string border; for (int i = 0; i < w - 2; i++) border += "─";
+        std::string f = "\033[2J";
+        f += "\033[" + std::to_string(top - 1) + ";1H" + paint("1", " " + dlgTitle);
+        f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+        std::string shown = dlgMask ? std::string(utf8_len(dlgValue), '*') : dlgValue;
+        std::string pad = shown;
+        while (utf8_len(pad) < (size_t)w - 4) pad += " ";
+        f += "\033[" + std::to_string(top + 1) + ";" + std::to_string(x0) + "H" + dim("│") + " " + pad + dim("│");
+        f += "\033[" + std::to_string(top + 2) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+        f += "\033[" + std::to_string(top + 4) + ";1H" + dim(L(" Enter — ок · Esc — отмена", " Enter — ok · Esc — cancel"));
+        f += "\033[J";
+        wraw(f);
+    }
+
+    std::vector<std::string> providerNames(Config& cfg) {
+        std::vector<std::string> out;
+        for (auto& [n, p] : cfg.providers) out.push_back(n);
+        return out;
+    }
+
+    bool run_settings(Config& cfg) {
+        setOpen = true; setPage = 0; setSel = 0; statusMsg.clear();
+        for (;;) {
+            draw();
+            int k = get_key();
+            if (k == -2) continue;
+            if (k == 27) { if (setPage == 0) break; else { setPage = 0; continue; } }
+            auto names = providerNames(cfg);
+            if (setPage == 0) {
+                if (k == K_UP && setSel > 0) setSel--;
+                if (k == K_DOWN && setSel < (int)names.size() - 1) setSel++;
+                if (k == 'a' || k == 'A') wizard(cfg);
+                if ((k == 'd' || k == 'D') && !names.empty()) {
+                    std::string ans = run_dialog(L("удалить '" + names[setSel] + "'? y/n", "delete '" + names[setSel] + "'? y/n"), "", false);
+                    if (ans == "y" || ans == "Y" || ans == "д") {
+                        cfg.providers.erase(names[setSel]);
+                        if (cfg.active_provider == names[setSel]) { cfg.active_provider.clear(); cfg.active_model.clear(); }
+                        save_config(cfg);
+                        setSel = 0;
+                    }
+                }
+                if (k == 'm' || k == 'M') {
+                    if (cfg.mode == "full") cfg.mode = "folder";
+                    else if (cfg.mode == "folder") cfg.mode = "read";
+                    else cfg.mode = "full";
+                    save_config(cfg);
+                    statusMsg = L("режим: ", "mode: ") + cfg.mode;
+                }
+                if (k == 'w' || k == 'W') {
+                    std::string wd = run_dialog(L("рабочая папка агента:", "agent workdir:"),
+                                                cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir, false);
+                    if (!wd.empty()) { cfg.workdir = wd; save_config(cfg); statusMsg = "workdir: " + wd; }
+                }
+                if (k == '\r' || k == '\n') {
+                    if (!names.empty()) { providerPage = names[setSel]; setPage = 1; setModelSel = 0; }
+                }
+            } else {
+                if (cfg.providers.count(providerPage) == 0) { setPage = 0; continue; }
+                auto& p = cfg.providers[providerPage];
+                if (k == K_UP && setModelSel > 0) setModelSel--;
+                if (k == K_DOWN && setModelSel < (int)p.models.size() - 1) setModelSel++;
+                if ((k == 'f' || k == 'F') && !providerPage.empty()) {
+                    statusMsg = L("обновляю модели…", "fetching models…");
+                    draw();
+                    auto ids = fetch_models(providerPage, p);
+                    if (!ids.empty()) { p.models = ids; save_config(cfg); statusMsg = L("моделей: ", "models: ") + std::to_string(ids.size()); }
+                    else statusMsg = L("не удалось получить список", "failed to fetch");
+                }
+                if (k == 'a' || k == 'A') {
+                    std::string m = run_dialog(L("имя модели:", "model name:"), "", false);
+                    if (!m.empty()) { p.models.push_back(m); save_config(cfg); }
+                }
+                if (k == '\r' || k == '\n') {
+                    if (!p.models.empty()) {
+                        cfg.active_provider = providerPage;
+                        cfg.active_model = p.models[setModelSel];
+                        save_config(cfg);
+                        statusMsg = L("выбрано: ", "selected: ") + cfg.active_model;
+                    }
+                }
+            }
+        }
+        setOpen = false;
+        return true;
+    }
+
+    void wizard(Config& cfg) {
+        std::vector<std::string> opts;
+        for (auto& [n, p] : PRESETS) opts.push_back(n + "  ·  " + p.second);
+        opts.push_back(L("другое (свой base_url)", "custom (own base_url)"));
+        int sel = 0;
+        for (;;) {
+            int w = cols < 60 ? cols - 4 : 56;
+            int h = (int)opts.size() + 4;
+            int top = (rows - h) / 2; if (top < 1) top = 1;
+            int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+            std::string border; for (int i = 0; i < w - 2; i++) border += "─";
+            std::string f = "\033[2J";
+            f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+            auto row = [&](int y, const std::string& txt) {
+                std::string p = txt;
+                while (utf8_len(p) < (size_t)w - 4) p += " ";
+                f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + dim("│") + p + dim("│");
+            };
+            row(top + 1, paint("1", " " + L("Добавить провайдера", "Add provider")));
+            for (int i = 0; i < (int)opts.size(); i++) {
+                row(top + 2 + i, (i == sel ? paint("38;5;208", " ❯ ") : "   ") + opts[i]);
+            }
+            f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+            f += "\033[J";
+            wraw(f);
+            int k = get_key();
+            if (k == -2) continue;
+            if (k == 27) return;
+            if (k == K_UP && sel > 0) sel--;
+            if (k == K_DOWN && sel < (int)opts.size() - 1) sel++;
+            if (k == '\r' || k == '\n') break;
+        }
+        bool custom = (sel == (int)opts.size() - 1);
+        std::string name, url;
+        if (!custom) {
+            int i = 0;
+            for (auto& [n, p] : PRESETS) { if (i++ == sel) { name = n; url = p.first; } }
+        } else {
+            name = run_dialog(L("имя провайдера:", "provider name:"), "", false);
+            if (name.empty()) return;
+        }
+        url = run_dialog("base_url:", url, false);
+        if (url.empty()) return;
+        while (!url.empty() && url.back() == '/') url.pop_back();
+        std::string key = run_dialog(L("API-ключ:", "API key:"), "", true);
+        Provider p; p.base_url = url; p.key = key;
+        cfg.providers[name] = p;
+        save_config(cfg);
+        statusMsg = L("обновляю модели…", "fetching models…");
+        auto ids = fetch_models(name, p);
+        cfg.providers[name].models = ids;
+        if (cfg.active_provider.empty() && !ids.empty()) {
+            cfg.active_provider = name;
+            cfg.active_model = ids[0];
+        }
+        save_config(cfg);
+        statusMsg = ids.empty()
+            ? L("добавлен, модели не получены", "added, no models fetched")
+            : L("добавлен, моделей: ", "added, models: ") + std::to_string(ids.size());
+    }
+
+    void draw_settings(Config& cfg) {
+        int w = cols < 64 ? cols - 4 : 60;
+        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+        std::string border; for (int i = 0; i < w - 2; i++) border += "─";
+        std::string f = "\033[2J";
+        auto row = [&](int y, const std::string& txt) {
+            std::string p = txt;
+            while (utf8_len(p) < (size_t)w - 4) p += " ";
+            f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + dim("│") + p + dim("│");
+        };
+        auto names = providerNames(cfg);
+        if (setPage == 0) {
+            int h = (int)names.size() + 8;
+            int top = (rows - h) / 2; if (top < 1) top = 1;
+            f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+            row(top + 1, paint("1", " " + L("Настройки", "Settings")));
+            row(top + 2, dim(" " + L("Enter — модели · a — добавить · d — удалить · m — режим · w — папка", "Enter — models · a — add · d — delete · m — mode · w — workdir")));
+            row(top + 3, dim(" ──────────────────────────────"));
+            if (names.empty()) row(top + 4, dim(" " + L("пусто — нажми a", "empty — press a")));
+            for (int i = 0; i < (int)names.size(); i++) {
+                auto& p = cfg.providers[names[i]];
+                std::string key = ::get_key(names[i], p).empty() ? red(L("нет ключа", "no key")) : green(L("ключ есть", "key set"));
+                std::string act = (names[i] == cfg.active_provider) ? paint("38;5;208", "●") : " ";
+                row(top + 4 + i, (i == setSel ? paint("38;5;208", " ❯ ") : "   ") + act + " " + names[i] + "  " + key);
+            }
+            int ly = top + 4 + (int)names.size();
+            std::string wd = cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir;
+            row(ly, dim(" " + L("режим: ", "mode: ")) + cfg.mode + dim("  ·  " + wd));
+            row(ly + 1, dim(" " + (statusMsg.empty() ? L("Esc — закрыть", "Esc — close") : statusMsg)));
+            f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+        } else {
+            if (cfg.providers.count(providerPage) == 0) { f += "\033[J"; wraw(f); return; }
+            auto& p = cfg.providers[providerPage];
+            int h = (int)p.models.size() + 7;
+            int top = (rows - h) / 2; if (top < 1) top = 1;
+            f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+            row(top + 1, paint("1", " " + providerPage + " · " + (cfg.active_provider == providerPage && !cfg.active_model.empty() ? cfg.active_model : "—")));
+            row(top + 2, dim(" " + L("Enter — выбрать · f — обновить · a — добавить модель", "Enter — select · f — fetch · a — add model")));
+            row(top + 3, dim(" ──────────────────────────────"));
+            if (p.models.empty()) row(top + 4, dim(" " + L("моделей нет — нажми f", "no models — press f")));
+            for (int i = 0; i < (int)p.models.size(); i++) {
+                std::string act = (p.models[i] == cfg.active_model && providerPage == cfg.active_provider) ? paint("38;5;208", "●") : " ";
+                row(top + 4 + i, (i == setModelSel ? paint("38;5;208", " ❯ ") : "   ") + act + " " + p.models[i]);
+            }
+            row(top + h - 2, dim(" " + (statusMsg.empty() ? L("Esc — назад", "Esc — back") : statusMsg)));
+            f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+        }
+        f += "\033[J";
+        wraw(f);
+    }
+
+    void draw() {
+        if (!active) return;
+        tui_size(rows, cols);
+        if (cols < 20 || rows < 6) return;
+        if (dlgOpen) { draw_dialog(); return; }
+        if (palOpen) { draw_palette(); return; }
+        if (setOpen && pCfg) { draw_settings(*pCfg); return; }
+        if (msgs.empty()) draw_splash(); else draw_chat();
     }
 
     int get_key() {
@@ -454,6 +903,11 @@ struct Tui {
             int k = get_key();
             if (k == -2) continue;
             if (k == -1 || k == 4) return "\x04";
+            if (k == 16) { // ctrl+p
+                std::string cmd = run_palette();
+                if (!cmd.empty()) return cmd;
+                continue;
+            }
             if (k == 3) {
                 if (!input.empty()) { input.clear(); continue; }
                 g_interrupt = true;
@@ -482,9 +936,8 @@ struct Tui {
     void enter() { tui_raw(true); wraw("\033[?1049h\033[H\033[2J"); }
     void leave() { wraw("\033[?1049l\033[?25h"); tui_raw(false); active = false; }
     void update_status(const Config& cfg) {
-        g_status = "v" + VERSION + " · " +
-            (cfg.active_provider.empty() ? std::string("—") : cfg.active_provider) + "/" +
-            (cfg.active_model.empty() ? std::string("—") : cfg.active_model);
+        g_status = (cfg.active_provider.empty() ? std::string("—") : cfg.active_provider) + "/" +
+                   (cfg.active_model.empty() ? std::string("—") : cfg.active_model);
     }
 };
 
@@ -502,13 +955,8 @@ struct LogBuf : std::stringbuf {
 std::string ask_line(bool secret = false) {
     if (tui.active) {
         std::cout.flush();
-        tui_mask = secret;
-        std::string v = tui.read_line();
-        tui_mask = false;
-        std::string p = tui.partial;
-        tui.partial.clear();
-        if (v == "\x04") return "";
-        tui.log.push_back(p + (secret ? std::string(Tui::utf8_len(v), '*') : v));
+        std::string v = tui.run_dialog("", "", secret);
+        if (!v.empty()) tui.addMsg(MsgKind::Info, (secret ? std::string(Tui::utf8_len(v), '*') : v));
         return v;
     }
     std::string v;
@@ -518,14 +966,8 @@ std::string ask_line(bool secret = false) {
 
 std::string ask_secret(const std::string& prompt) {
     if (tui.active) {
-        std::cout.flush();
-        std::string p = tui.partial;
-        tui.partial.clear();
-        tui_mask = true;
-        std::string v = tui.read_line();
-        tui_mask = false;
-        if (v == "\x04") return "";
-        tui.log.push_back(p + std::string(Tui::utf8_len(v), '*'));
+        std::string v = tui.run_dialog(prompt, "", true);
+        if (!v.empty()) tui.addMsg(MsgKind::Info, std::string(Tui::utf8_len(v), '*'));
         return v;
     }
     return getpass_cpp(prompt);
@@ -574,6 +1016,11 @@ size_t stream_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
                 std::cerr << red("\n" + obj["error"].dump()) << "\n";
                 continue;
             }
+            if (obj.contains("usage") && obj["usage"].is_object()) {
+                g_usage.got = true;
+                g_usage.prompt = obj["usage"].value("prompt_tokens", 0);
+                g_usage.completion = obj["usage"].value("completion_tokens", 0);
+            }
             auto choices = obj.value("choices", json::array());
             if (choices.empty()) continue;
             auto delta = choices[0].value("delta", json::object());
@@ -606,7 +1053,7 @@ CurlResponse http_get(const std::string& url, const std::string& key) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4.1");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.5");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status);
@@ -632,7 +1079,7 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4.1");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.5");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     StreamState st{on_chunk, "", show_think};
@@ -682,6 +1129,124 @@ int choose_item(const std::vector<std::string>& items, const std::string& curren
     return -1;
 }
 
+// ---------- агент: выполнение команд ----------
+
+std::vector<std::string> extractRunBlocks(const std::string& s) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    for (;;) {
+        size_t p = s.find("```run", pos);
+        if (p == std::string::npos) break;
+        size_t nl = s.find('\n', p);
+        if (nl == std::string::npos) break;
+        size_t endq = s.find("```", nl);
+        if (endq == std::string::npos) break;
+        std::string body = s.substr(nl + 1, endq - nl - 1);
+        while (!body.empty() && (body.back() == '\n' || body.back() == ' ')) body.pop_back();
+        while (!body.empty() && body.front() == ' ') body.erase(0, 1);
+        if (!body.empty()) out.push_back(body);
+        pos = endq + 3;
+    }
+    return out;
+}
+
+bool isReadCmd(const std::string& cmd) {
+    static const char* allow[] = {"ls","cat","head","tail","grep","find","wc","du","df","ps",
+        "file","stat","which","uname","uptime","free","whoami","pwd","date","echo","id",
+        "hostname","lsblk","lscpu","ip","ss","git","man","sort","uniq","cut","awk"};
+    if (cmd.find('>') != std::string::npos || cmd.find('`') != std::string::npos ||
+        cmd.find("$(") != std::string::npos)
+        return false;
+    std::string seg;
+    std::vector<std::string> segs;
+    for (size_t i = 0; i < cmd.size(); i++) {
+        if (cmd[i] == ';' || cmd[i] == '|') {
+            segs.push_back(seg); seg.clear();
+            if (i + 1 < cmd.size() && (cmd[i+1] == '&' || cmd[i+1] == '|')) i++;
+            continue;
+        }
+        seg += cmd[i];
+    }
+    segs.push_back(seg);
+    for (auto& s : segs) {
+        while (!s.empty() && s.front() == ' ') s.erase(0, 1);
+        if (s.empty()) continue;
+        std::string first = s.substr(0, s.find(' '));
+        bool ok = false;
+        for (auto* a : allow) if (first == a) { ok = true; break; }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+std::string execShell(const std::string& cmdline) {
+#ifdef _WIN32
+    FILE* f = _popen(cmdline.c_str(), "r");
+#else
+    FILE* f = popen(cmdline.c_str(), "r");
+#endif
+    if (!f) return "(failed to start)";
+    std::string out;
+    char buf[4096];
+    size_t total = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        out += buf;
+        total += strlen(buf);
+        if (total > 65536) { out += "\n…(обрезано)"; break; }
+    }
+    int rc =
+#ifdef _WIN32
+        _pclose(f);
+#else
+        pclose(f);
+#endif
+    return out + "[exit: " + std::to_string(rc) + "]";
+}
+
+std::string runToolCmd(const std::string& cmd, const Config& cfg) {
+    std::string wd = cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir;
+#ifdef _WIN32
+    return "cd /d \"" + wd + "\" && " + cmd;
+#else
+    return "cd '" + wd + "' && " + cmd;
+#endif
+}
+
+bool approveTool(const std::string& cmd, const Config& cfg, std::set<std::string>& approved) {
+    if (cfg.mode == "read") return isReadCmd(cmd);
+    if (approved.count(cmd)) return true;
+    if (tui.active) {
+        std::string a = tui.run_dialog(L("Выполнить команду? y/n/a(всегда)", "Run command? y/n/a(always)"), cmd, false);
+        if (a == "y" || a == "Y" || a == "yes" || a == "д" || a == "да") return true;
+        if (a == "a" || a == "A" || a == "always") { approved.insert(cmd); return true; }
+        return false;
+    }
+    std::cout << paint("38;5;208", " ▌ ") << cmd << "\n"
+              << dim(L("выполнить? [y/n/a=всегда] ", "run? [y/n/a=always] "));
+    std::cout.flush();
+    std::string a;
+    std::getline(std::cin, a);
+    if (a == "y" || a == "Y" || a == "yes" || a == "д") return true;
+    if (a == "a" || a == "A") { approved.insert(cmd); return true; }
+    return false;
+}
+
+std::string agentPrompt(const Config& cfg) {
+    std::string wd = cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir;
+#ifdef _WIN32
+    std::string osname = "windows";
+#else
+    std::string osname = "linux";
+#endif
+    std::string base = L("Ты — агент в терминале пользователя. ОС: " + osname + ". Рабочая папка: " + wd + ". ",
+                         "You are a terminal agent. OS: " + osname + ". Workdir: " + wd + ". ");
+    if (cfg.mode == "read")
+        return base + L("Режим read-only: тебе доступны только команды чтения (ls, cat, head, tail, grep, find, wc, du, df, ps, file, stat).",
+                        "Read-only mode: only reading commands are available (ls, cat, head, tail, grep, find, wc, du, df, ps, file, stat).");
+    return base + L("Чтобы выполнить команду оболочки, выведи её отдельным блоком:\n```run\nкоманда\n```\nКлиент спросит подтверждение и вернёт вывод следующим сообщением. Не выдумывай результаты команд — жди их.",
+                    "To run a shell command output a block:\n```run\ncommand\n```\nThe client will ask for confirmation and return the output. Never invent command results — wait for them.");
+}
+
 void cmd_send(Config& cfg, const std::string& text,
               std::vector<json>& messages, bool show_think,
               const json& extra_content = json()) {
@@ -691,56 +1256,104 @@ void cmd_send(Config& cfg, const std::string& text,
         return;
     }
     json user_msg;
-    if (extra_content.is_array()) {
+    if (extra_content.is_array())
         user_msg = {{"role", "user"}, {"content", extra_content}};
-    } else {
+    else
         user_msg = {{"role", "user"}, {"content", text}};
-    }
     messages.push_back(user_msg);
 
-    json payload_msgs = json::array();
-    if (!cfg.system_prompt.empty())
-        payload_msgs.push_back({{"role", "system"}, {"content", cfg.system_prompt}});
-    for (auto& m : messages) payload_msgs.push_back(m);
+    std::set<std::string> approved;
 
-    json payload = {
-        {"model", cfg.active_model},
-        {"messages", payload_msgs},
-        {"stream", true}
-    };
+    for (int agentIter = 0; agentIter < 8; agentIter++) {
+        json payload_msgs = json::array();
+        if (!cfg.system_prompt.empty())
+            payload_msgs.push_back({{"role", "system"}, {"content", cfg.system_prompt}});
+        payload_msgs.push_back({{"role", "system"}, {"content", agentPrompt(cfg)}});
+        for (auto& m : messages) payload_msgs.push_back(m);
 
-    std::string url = p->base_url + "/chat/completions";
-    std::string key = get_key(cfg.active_provider, *p);
-    std::string answer;
-    bool thinking = false;
+        json payload = {
+            {"model", cfg.active_model},
+            {"messages", payload_msgs},
+            {"stream", true}
+        };
 
-    bool ok = chat_stream_curl(url, key, payload, show_think,
-        [&](const std::string& kind, const std::string& piece) {
-            if (kind == "think") {
-                if (!thinking) { std::cout << dim(L("┌ рассуждает\n", "┌ thinking\n")); thinking = true; }
-                std::cout << dim(piece);
-            } else {
-                if (thinking) { std::cout << "\n\n"; thinking = false; }
-                std::cout << piece;
-                answer += piece;
+        std::string url = p->base_url + "/chat/completions";
+        std::string key = get_key(cfg.active_provider, *p);
+        std::string answer;
+        bool thinking = false;
+        auto t0 = std::chrono::steady_clock::now();
+        g_usage = Usage();
+        if (tui.active) tui.beginStream();
+
+        bool ok = chat_stream_curl(url, key, payload, show_think,
+            [&](const std::string& kind, const std::string& piece) {
+                if (kind == "think") {
+                    if (!thinking) { std::cout << dim(L("┌ рассуждает\n", "┌ thinking\n")); thinking = true; }
+                    std::cout << dim(piece);
+                } else {
+                    if (thinking) { std::cout << "\n\n"; thinking = false; }
+                    std::cout << piece;
+                    answer += piece;
+                }
+                std::cout.flush();
+                tui_poll_interrupt();
+            });
+        bool interrupted = g_interrupt;
+        g_interrupt = false;
+
+        if (interrupted) std::cout << dim(L("[прервано]", "[interrupted]")) << "\n";
+        if (!ok && !interrupted) {
+            std::cerr << red(L("Ошибка сети", "Network error")) << "\n";
+            messages.pop_back();
+            return;
+        }
+
+        double dur = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        long toks = g_usage.got ? g_usage.completion : (long)((Tui::utf8_len(answer) + 3) / 4);
+        double tps = dur > 0.05 ? toks / dur : 0.0;
+        std::string meta = "Chat · " + cfg.active_model + " · " + fmtDur(dur);
+        if (toks > 0) meta += " · " + fmtTps(tps);
+        if (g_usage.got) g_ctx_tokens = g_usage.prompt + g_usage.completion;
+        else g_ctx_tokens += toks;
+        g_usage = Usage();
+        if (tui.active) tui.addMsg(MsgKind::Meta, meta);
+        else std::cout << dim(meta) << "\n";
+
+        if (!answer.empty())
+            messages.push_back({{"role", "assistant"}, {"content", answer}});
+        else {
+            messages.pop_back();
+            return;
+        }
+
+        auto blocks = extractRunBlocks(answer);
+        if (blocks.empty() || interrupted) break;
+
+        std::string results;
+        for (auto& cmd : blocks) {
+            bool allowed = approveTool(cmd, cfg, approved);
+            if (!allowed) {
+                std::string why = (cfg.mode == "read" && !isReadCmd(cmd))
+                    ? L("read-only: запись запрещена", "read-only: writes are blocked")
+                    : L("отклонено пользователем", "declined by user");
+                results += L("пользователь отклонил команду: ", "user declined command: ") + cmd + " (" + why + ")\n";
+                if (tui.active) tui.addMsg(MsgKind::Error, "$ " + cmd + " — " + why);
+                else std::cout << red("$ " + cmd + " — " + why) << "\n";
+                continue;
             }
-            std::cout.flush();
-            tui_poll_interrupt();
-        });
-    bool interrupted = g_interrupt;
-    g_interrupt = false;
+            if (tui.active) tui.addMsg(MsgKind::Info, "$ " + cmd);
+            else std::cout << dim("$ " + cmd) << "\n";
+            std::string out = execShell(runToolCmd(cmd, cfg));
+            std::string disp = out;
+            if (disp.size() > 2000) disp = disp.substr(0, 2000) + "\n…";
+            if (tui.active) tui.addMsg(MsgKind::Info, disp);
+            else std::cout << dim(disp) << "\n";
+            results += "$ " + cmd + "\n" + out + "\n";
+        }
 
-    std::cout << "\n";
-    if (interrupted) std::cout << dim(L("[прервано]", "[interrupted]")) << "\n";
-    if (!ok && !interrupted) {
-        std::cerr << red(L("Ошибка сети", "Network error")) << "\n";
-        messages.pop_back();
-        return;
-    }
-    if (!answer.empty()) {
-        messages.push_back({{"role", "assistant"}, {"content", answer}});
-    } else {
-        messages.pop_back();
+        messages.push_back({{"role", "user"},
+            {"content", L("[вывод команд]\n", "[command output]\n") + results + L("\nПродолжай задачу.", "\nContinue the task.")}});
+        if (tui.active) tui.addMsg(MsgKind::Info, L("↑ результат передан модели", "↑ result sent to model"));
     }
 }
 
@@ -905,7 +1518,7 @@ bool handle_command(Config& cfg, const std::string& line,
         std::cout << dim(show_think ? L("Рассуждения: показываю", "Reasoning: shown") : L("Рассуждения: скрыты", "Reasoning: hidden")) << "\n";
     } else if (cmd == "clear") {
         messages.clear();
-        if (tui.active) { tui.log.clear(); tui.partial.clear(); }
+        if (tui.active) tui.msgs.clear();
         std::cout << dim(L("Диалог очищен", "Chat cleared")) << "\n";
     } else if (cmd == "file") {
         auto [path, question] = split_cmd_arg(arg);
@@ -948,6 +1561,38 @@ bool handle_command(Config& cfg, const std::string& line,
             std::cout << yellow(L("Внимание: модель '", "Warning: model '") + cfg.active_model + L("' возможно не поддерживает фото.", "' may not support images.")) << "\n";
         }
         cmd_send(cfg, "", messages, show_think, content);
+    } else if (cmd == "settings") {
+        if (tui.active) tui.run_settings(cfg);
+        else std::cout << dim(L("настройки доступны в TUI (запусти в терминале)", "settings available in TUI mode")) << "\n";
+    } else if (cmd == "mode") {
+        if (arg == "full" || arg == "folder" || arg == "read") {
+            cfg.mode = arg; save_config(cfg);
+            std::cout << green(L("режим: ", "mode: ") + cfg.mode) << "\n";
+        } else {
+            std::cout << dim(L("режим: ", "mode: ") + cfg.mode + L("  (full | folder | read)", "  (full | folder | read)")) << "\n";
+        }
+    } else if (cmd == "cwd") {
+        if (arg.empty()) {
+            std::cout << dim(cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir) << "\n";
+        } else {
+            std::string wd = arg;
+            if (!wd.empty() && wd[0] == '~') {
+                const char* h = std::getenv("HOME");
+                if (h) wd = std::string(h) + wd.substr(1);
+            }
+            cfg.workdir = wd; save_config(cfg);
+            std::cout << green("workdir: " + wd) << "\n";
+        }
+    } else if (cmd == "plugins") {
+        fs::path pd = conf_dir() / "plugins";
+        bool any = false;
+        if (fs::exists(pd))
+            for (auto& e : fs::directory_iterator(pd))
+                if (e.path().extension() == ".md") {
+                    std::cout << " /" << e.path().stem().string() << "\n";
+                    any = true;
+                }
+        if (!any) std::cout << dim(L("плагинов нет — положи .md файлы в ", "no plugins — put .md files in ") + pd.string()) << "\n";
     } else if (cmd == "language" || cmd == "lang") {
         if (arg == "en" || arg == "english") {
             lang = 1;
@@ -961,7 +1606,16 @@ bool handle_command(Config& cfg, const std::string& line,
             std::cout << dim(lang ? "Current: English. Use: /language ru|en" : "Текущий: русский. Использование: /language ru|en") << "\n";
         }
     } else {
-        std::cerr << red(L("Неизвестная команда /" + cmd + ". Список: /help", "Unknown command /" + cmd + ". See: /help")) << "\n";
+        fs::path pp = conf_dir() / "plugins" / (cmd + ".md");
+        if (fs::exists(pp)) {
+            std::ifstream f(pp);
+            std::string tpl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            if (!arg.empty()) tpl += "\n\n" + arg;
+            std::cout << dim(L("плагин: ", "plugin: ") + cmd) << "\n";
+            cmd_send(cfg, tpl, messages, show_think);
+        } else {
+            std::cerr << red(L("Неизвестная команда /" + cmd + ". Список: /help", "Unknown command /" + cmd + ". See: /help")) << "\n";
+        }
     }
     return true;
 }
@@ -1000,16 +1654,13 @@ int console_main(Config& cfg) {
 int tui_main(Config& cfg) {
     tui.active = true;
     COLOR = true;
+    tui.pCfg = &cfg;
     tui.enter();
     LogBuf lbuf;
     auto* old_out = std::cout.rdbuf(&lbuf);
     auto* old_err = std::cerr.rdbuf(&lbuf);
 
     tui.update_status(cfg);
-    std::cout << paint("38;5;208", L("Привет! Я kinecode.", "Hi! I'm kinecode.")) << "\n";
-    std::cout << dim(L("Напиши вопрос или /help — команды. /exit — выход.",
-                       "Type a question or /help for commands. /exit to quit.")) << "\n";
-    std::cout.flush();
 
     std::vector<json> messages;
     bool show_think = true;
@@ -1019,12 +1670,16 @@ int tui_main(Config& cfg) {
         std::string line = tui.read_line();
         if (line == "\x04") break;
         if (line.empty()) continue;
-        tui.flush_partial();
-        tui.log.push_back(paint("38;5;208", " ❯ ") + line);
+        tui.addMsg(MsgKind::User, line);
+        if (tui.sessionTitle.empty()) {
+            tui.sessionTitle = line;
+            size_t nl = tui.sessionTitle.find('\n');
+            if (nl != std::string::npos) tui.sessionTitle = tui.sessionTitle.substr(0, nl);
+            if (tui.sessionTitle.size() > 34) tui.sessionTitle = tui.sessionTitle.substr(0, 34) + "…";
+        }
         bool cont = handle_command(cfg, line, messages, show_think);
         std::cout.flush();
-        tui.flush_partial();
-        tui.draw();
+                tui.draw();
         if (!cont) break;
     }
 

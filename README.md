@@ -20,6 +20,20 @@ signing certificate.
 
 ## Features
 
+- **Agent mode** — the model can run shell commands on your machine: it outputs a ```run``` block, you approve with y/n, the output is fed back. Three access modes: `full` (any command, per-command confirm), `folder` (runs in your chosen workdir), `read` (only reading commands auto-allowed: ls, cat, grep, ...)
+- **Settings screen** (`/settings` or ctrl+p) — add providers from a built-in catalog (DeepSeek, Groq, OpenRouter, NVIDIA, Gemini), paste API keys, pick models
+- **Plugins** — drop `.md` files into `~/.config/kinecode/plugins/` and they become slash commands (`/review` etc.)
+- **ctrl+p command palette** with fuzzy filter
+- **OpenCode-style TUI** — splash with ASCII banner, message blocks, session sidebar with token counter, `Chat · model · 1.3s · 9.9 tok/s` meta lines, input history (↑/↓), `Ctrl+C` interrupt
+- **Multi-provider** — switch between APIs on the fly
+- **Streaming** — real-time token-by-token output with tok/s stats
+- **Reasoning support** — shows/hides model thinking (`/think on|off`)
+- **File upload** — send text files (`/file <path>`), **Image upload** (`/img <path>`)
+- **Language switch** — `/language ru|en`
+- **Config persistence** — providers, keys, mode, workdir in `~/.config/kinecode/config.json`
+
+## Features (old)
+
 - **Full-screen TUI** — clean interface with ASCII banner, message log, input box, history (↑/↓), `Ctrl+C` interrupt. Runs automatically in a terminal; plain console mode for pipes/scripts
 - **Multi-provider** — switch between APIs on the fly
 - **Streaming** — real-time token-by-token output
