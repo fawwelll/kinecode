@@ -22,14 +22,17 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - name: deps
-        run: vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-curl mingw-w64-x86_64-nlohmann-json
       - name: build
-        shell: cmd
-        run: |
-          cl /EHsc /O2 /std:c++17 /I "%VCPKG_INSTALLATION_ROOT%\installed\x64-windows-static\include" kinecode.cpp /Fe:kinecode.exe /link /LIBPATH:"%VCPKG_INSTALLATION_ROOT%\installed\x64-windows-static\lib" libcurl.lib ws2_32.lib wldap32.lib crypt32.lib advapi32.lib normaliz.lib
+        run: g++ -std=c++17 -O2 -o kinecode.exe kinecode.cpp -lcurl -lws2_32 -lwldap32 -static-libgcc -static-libstdc++
       - uses: actions/upload-artifact@v4
         with:
           name: kinecode-windows

@@ -33,7 +33,7 @@ int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
 
 fs::path conf_dir() {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__MINGW32__)
     const char* appdata = std::getenv("APPDATA");
     fs::path base = appdata ? appdata : ".";
     return base / APP;
@@ -184,7 +184,9 @@ void save_config(const Config& cfg) {
     std::ofstream f(conf_file());
     f << j.dump(2);
     #ifndef _WIN32
+    #ifndef _WIN32
     fs::permissions(conf_file(), fs::perms::owner_read | fs::perms::owner_write);
+#endif
 #endif
 }
 
