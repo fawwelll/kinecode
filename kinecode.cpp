@@ -31,7 +31,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.4";
+const std::string VERSION = "0.4.1";
 
 int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
@@ -606,7 +606,7 @@ CurlResponse http_get(const std::string& url, const std::string& key) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4.1");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status);
@@ -632,7 +632,7 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4.1");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     StreamState st{on_chunk, "", show_think};
@@ -999,6 +999,7 @@ int console_main(Config& cfg) {
 
 int tui_main(Config& cfg) {
     tui.active = true;
+    COLOR = true;
     tui.enter();
     LogBuf lbuf;
     auto* old_out = std::cout.rdbuf(&lbuf);
