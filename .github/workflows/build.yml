@@ -67,14 +67,15 @@ jobs:
         run: g++ -std=c++17 -O2 $(pkg-config --cflags libcurl) -o kinecode-linux kinecode.cpp $(pkg-config --libs libcurl) -lreadline
       - name: package appimage
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          set -e
+          wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appimage-extract >/dev/null
           mkdir -p AppDir/usr/bin
           cp kinecode-linux AppDir/usr/bin/kinecode
-          ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run \
-            --appdir AppDir -d kinecode.desktop -i icon.png --output appimage
-          mv kinecode-*.AppImage kinecode-x86_64.AppImage
+          ./squashfs-root/AppRun --appdir AppDir -d kinecode.desktop -i icon.png --output appimage
+          ls *.AppImage
+          mv $(ls kinecode-*.AppImage | head -1) kinecode-x86_64.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: kinecode-appimage
