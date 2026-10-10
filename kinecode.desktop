@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=kinecode
+Comment=Minimal terminal AI client
+Icon=utilities-terminal
+Exec=kinecode
+Terminal=true
+Categories=Development;

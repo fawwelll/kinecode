@@ -32,7 +32,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.5";
+const std::string VERSION = "0.7.0";
 
 int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
@@ -51,6 +51,18 @@ fs::path conf_dir() {
 fs::path conf_file() { return conf_dir() / "config.json"; }
 fs::path hist_file() { return conf_dir() / "history"; }
 
+// разовый перенос конфигурации из старого каталога dscode (ключи, история, плагины)
+void migrate_old_config() {
+    try {
+        fs::path kdir = conf_dir();
+        fs::path odir = kdir.parent_path() / "dscode";
+        if (!fs::exists(kdir) && fs::exists(odir)) {
+            fs::create_directories(kdir.parent_path());
+            fs::copy(odir, kdir, fs::copy_options::recursive);
+        }
+    } catch (...) {}
+}
+
 #if defined(_WIN32) || defined(__MINGW32__)
 bool COLOR = _isatty(_fileno(stdout)) && !std::getenv("NO_COLOR");
 #else
@@ -67,25 +79,24 @@ std::string green(const std::string& s)  { return paint("32", s); }
 std::string yellow(const std::string& s) { return paint("33", s); }
 std::string cyan(const std::string& s)   { return paint("1;36", s); }
 
+// цвет, который сбрасывает только foreground (сохраняет фон) — для строк с подложкой
+std::string fg(const std::string& code, const std::string& s) {
+    if (!COLOR) return s;
+    return "\033[" + code + "m" + s + "\033[39m";
+}
+
 std::string rl_paint(const std::string& code, const std::string& s) {
     if (!COLOR) return s;
     return "\001\033[" + code + "m\002" + s + "\001\033[0m\002";
 }
 
 const char* BANNER = R"(
-______  _____ _____ ___________ _____
-|  _  \/  ___/  __ \  _  |  _  \  ___|
-| | | |\ `--.| /  \/ | | | | | | |__
-| | | | `--. \ |   | | | | | | |  __|
-| |/ / /\__/ / \__/\ \_/ / |/ /| |___
-|___/  \____/ \____/\___/|___/ \____/
-
- _   _   ___  ______ _   _  _____ _____ _____
-| | | | / _ \ | ___ \ \ | ||  ___/  ___/  ___|
-| |_| |/ /_\ \| |_/ /  \| || |__ \ `--.\ `--.
-|  _  ||  _  ||    /| . ` ||  __| `--. \`--. \
-| | | || | | || |\ \| |\  || |___/\__/ /\__/ /
-\_| |_/\_| |_/\_| \_\_| \_/\____/\____/\____/
+██╗  ██╗██╗███╗   ██╗███████╗ ██████╗ ██████╗ ██████╗ ███████╗
+██║ ██╔╝██║████╗  ██║██╔════╝██╔════╝██╔═══██╗██╔══██╗██╔════╝
+█████╔╝ ██║██╔██╗ ██║█████╗  ██║     ██║   ██║██║  ██║█████╗
+██╔═██╗ ██║██║╚██╗██║██╔══╝  ██║     ██║   ██║██║  ██║██╔══╝
+██║  ██╗██║██║ ╚████║███████╗╚██████╗╚██████╔╝██████╔╝███████╗
+╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
 )";
 
 std::string about_text() {
@@ -348,6 +359,12 @@ struct Tui {
     bool dlgOpen = false;
     std::string dlgTitle, dlgValue;
     bool dlgMask = false;
+    bool wizOpen = false;
+    int wizSel = 0;
+    std::string wizTitle;
+    std::vector<std::string> wizOpts;
+    int curPanelY = 0;          // строка ввода на текущем кадре (для позиционирования курсора)
+    std::string lastFrameKey;   // для подавления мерцания: полная очистка только при смене экрана
     Config* pCfg = nullptr;
 
     void addMsg(MsgKind k, const std::string& t) {
@@ -410,8 +427,46 @@ struct Tui {
         return out;
     }
 
-    int sidebarW() const { return (cols >= 112) ? 28 : 0; }
-    int contentW() const { return cols - sidebarW() - 2; }
+    // ---------- геометрия и примитивы рисования ----------
+    static std::string stripSgr(const std::string& s) {
+        std::string out;
+        for (size_t i = 0; i < s.size();) {
+            if (s[i] == '\033') {
+                size_t j = i;
+                while (j < s.size() && s[j] != 'm') j++;
+                i = (j < s.size()) ? j + 1 : s.size();
+            } else out += s[i++];
+        }
+        return out;
+    }
+    static int visLen(const std::string& s) { return (int)utf8_len(stripSgr(s)); }
+    static std::string clampVis(const std::string& s, int maxw) {
+        if (visLen(s) <= maxw) return s;   // SGR-коды не считаются шириной
+        std::string plain = stripSgr(s);   // при обрезке теряем цвет, но не ломаем ANSI
+        while ((int)utf8_len(plain) > maxw) utf8_pop(plain);
+        return plain;
+    }
+
+    int panelW() const { return cols < 64 ? cols - 4 : 58; }
+
+    // строка модального окна с подложкой (заливается полностью, до самого края)
+    void modalRow(std::string& f, int y, int x0, int w, const std::string& content, bool sel = false, const char* bgOverride = nullptr) {
+        int vis = visLen(content);
+        int pad = w - 4 - vis; if (pad < 0) pad = 0;
+        std::string bg = sel ? std::string("\033[48;5;215m\033[30m")
+                             : (bgOverride ? std::string(bgOverride) : std::string("\033[48;5;235m"));
+        f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + bg + "  " + content
+           + bg + std::string((size_t)pad, ' ') + "  \033[0m";
+    }
+
+    // строка панели ввода: синяя полоса слева + тёмная подложка (стиль opencode)
+    void panelRow(std::string& f, int y, int x0, int w, const std::string& content) {
+        int vis = visLen(content);
+        int pad = w - 3 - vis; if (pad < 0) pad = 0;
+        f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H"
+           + "\033[48;5;33m \033[0m\033[48;5;235m " + content
+           + "\033[48;5;235m" + std::string((size_t)pad, ' ') + " \033[0m";
+    }
 
     std::vector<std::string> blockRows(const Msg& m, int width) {
         std::vector<std::string> rows;
@@ -421,186 +476,261 @@ struct Tui {
             return rows;
         }
         if (m.kind == MsgKind::Error) {
-            for (auto& r : wrap_ansi("\033[31m" + m.text + "\033[0m", width)) rows.push_back(" " + r);
+            std::string bar = paint("38;5;203", "▌");
+            for (auto& r : wrap_ansi(paint("38;5;203", m.text), width - 2)) rows.push_back(bar + " " + r);
             rows.push_back("");
             return rows;
         }
-        std::string bar = (m.kind == MsgKind::User) ? paint("38;5;208", "▌") : dim("▌");
+        std::string bar = (m.kind == MsgKind::User) ? paint("38;5;33", "▌") : paint("38;5;240", "▌");
         for (auto& r : wrap_ansi(m.text, width - 2)) rows.push_back(bar + " " + r);
         rows.push_back("");
         return rows;
     }
 
-    void draw_splash() {
-        std::vector<std::string> art;
-        art.push_back(paint("38;5;208", "______  _____ _____ ___________ _____"));
-        art.push_back(paint("38;5;208", "|  _  \\/  ___/  __ \\  _  |  _  \\  ___|"));
-        art.push_back(paint("38;5;208", "| | | |\\ `--.| /  \\/ | | | | | | |__"));
-        art.push_back(paint("38;5;208", "| | | | `--. \\ |   | | | | | | |  __|"));
-        art.push_back(paint("38;5;208", "| |/ / /\\__/ / \\__/\\ \\_/ / |/ /| |___"));
-        art.push_back(paint("38;5;208", "|___/  \\____/ \\____/\\___/|___/ \\____/"));
-        art.push_back("");
-        art.push_back(dim(" _   _   ___  ______ _   _  _____ _____ _____"));
-        art.push_back(dim("| | | | / _ \\ | ___ \\ \\ | ||  ___/  ___/  ___|"));
-        art.push_back(dim("| |_| |/ /_\\ \\| |_/ /  \\| || |__ \\ `--.\\ `--."));
-        art.push_back(dim("|  _  ||  _  ||    /| . ` ||  __| `--. \\`--. \\"));
-        art.push_back(dim("| | | || | | || |\\ \\| |\\  || |___/\\__/ /\\__/ /"));
-        art.push_back(dim("\\_| |_/\\_| |_/\\_| \\_\\_| \\_/\\____/\\____/\\____/"));
+    static constexpr const char* LOGO[6] = {
+        "██╗  ██╗██╗███╗   ██╗███████╗ ██████╗ ██████╗ ██████╗ ███████╗",
+        "██║ ██╔╝██║████╗  ██║██╔════╝██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+        "█████╔╝ ██║██╔██╗ ██║█████╗  ██║     ██║   ██║██║  ██║█████╗  ",
+        "██╔═██╗ ██║██║╚██╗██║██╔══╝  ██║     ██║   ██║██║  ██║██╔══╝  ",
+        "██║  ██╗██║██║ ╚████║███████╗╚██████╗╚██████╔╝██████╔╝███████╗",
+        "╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
+    };
 
-        int boxW = cols < 60 ? cols - 4 : 58;
-        int totalH = (int)art.size() + 2 + 3 + 2;
-        int top = (rows - totalH) / 2; if (top < 1) top = 1;
-        std::string f = "\033[H\033[2J";
-        for (auto& a : art) {
-            long alen = (long)utf8_len(a);
-            int pad = (cols - (int)alen) / 2; if (pad < 0) pad = 0;
-            f += "\033[" + std::to_string(top++) + ";1H" + std::string(pad, ' ') + a;
+    std::string short_cwd() {
+        std::string cwd;
+        try { cwd = fs::current_path().string(); } catch (...) { return "~"; }
+        const char* h = std::getenv("HOME");
+#ifdef _WIN32
+        if (!h) h = std::getenv("USERPROFILE");
+#endif
+        if (h && *h) {
+            std::string home(h);
+            if (cwd.rfind(home, 0) == 0) cwd = "~" + cwd.substr(home.size());
         }
-        top++;
-        int x0 = (cols - boxW) / 2; if (x0 < 1) x0 = 1;
-        std::string inner = input;
-        if (inner.empty() && !tui_mask) inner = dim(L(" Спроси что угодно… '/help'", " Ask anything… '/help'"));
-        std::string border; for (int i = 0; i < boxW - 2; i++) border += "─";
-        std::string padIn = inner;
-        while (utf8_len(padIn) < (size_t)boxW - 4) padIn += " ";
-        f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
-        f += "\033[" + std::to_string(top + 1) + ";" + std::to_string(x0) + "H" + dim("│") + padIn + dim("│");
-        f += "\033[" + std::to_string(top + 2) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
-        top += 4;
-        std::string st = " Chat · " + g_status;
-        int pad = (cols - (int)utf8_len(st)) / 2; if (pad < 0) pad = 0;
-        f += "\033[" + std::to_string(top) + ";1H" + std::string(pad, ' ') + dim(st);
-        if (g_status.find("—/—") != std::string::npos) {
-            top++;
-            std::string hint = L(" Настрой провайдера: ctrl+p → /settings", " Set up a provider: ctrl+p → /settings");
-            pad = (cols - (int)utf8_len(hint)) / 2; if (pad < 0) pad = 0;
-            f += "\033[" + std::to_string(top) + ";1H" + std::string(pad, ' ') + paint("38;5;208", hint);
+        // обрезка по символам UTF-8 (не по байтам), чтобы не ломать кириллицу
+        bool cut = false;
+        while (utf8_len(cwd) > 21 && !cwd.empty()) {
+            unsigned char c = (unsigned char)cwd[0];
+            size_t len = (c < 0x80) ? 1 : ((c >> 5) == 6 ? 2 : ((c >> 4) == 14 ? 3 : 4));
+            if (len > cwd.size()) break;
+            cwd.erase(0, len);
+            cut = true;
         }
-        f += "\033[" + std::to_string(rows) + ";1H" + dim(" " + footerText());
-        f += "\033[J";
-        wraw(f);
+        if (cut) cwd = "…" + cwd;
+        return cwd;
     }
 
-    std::string footerText() {
-        return L("/help · ctrl+p команды · ctrl+c прервать · /exit",
-                 "/help · ctrl+p commands · ctrl+c interrupt · /exit");
+    // панель ввода в стиле opencode: подложка + синяя полоса слева, 3 строки
+    void draw_panel(std::string& f, int y, const std::string& placeholder, int w) {
+        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+        std::string txt = input;
+        while ((int)utf8_len(txt) > w - 8) utf8_pop(txt);
+        std::string content = (txt.empty() && !tui_mask) ? fg("90", placeholder) : txt;
+        panelRow(f, y, x0, w, content);
+        panelRow(f, y + 1, x0, w, "");
+        bool noProvider = (g_status == "—/—" || g_status == "-/-");
+        std::string meta = fg("38;5;33", "Chat")
+            + (noProvider
+                ? fg("90", " · " + L("провайдер: ctrl+p → /settings", "provider: ctrl+p → /settings"))
+                : fg("90", " · " + g_status));
+        panelRow(f, y + 2, x0, w, clampVis(meta, w - 6));
     }
 
-    void draw_input_box(std::string& f, int y_top, int width, const std::string& placeholder) {
-        std::string inner = input;
-        if (inner.empty() && !tui_mask) inner = dim(placeholder);
-        std::string border; for (int i = 0; i < width - 2; i++) border += "─";
-        std::string pad = inner;
-        while (utf8_len(pad) < (size_t)width - 4) pad += " ";
-        f += "\033[" + std::to_string(y_top) + ";1H" + dim("╭" + border + "╮");
-        f += "\033[" + std::to_string(y_top + 1) + ";1H" + dim("│") + " " + pad + dim("│");
-        f += "\033[" + std::to_string(y_top + 2) + ";1H" + dim("╰" + border + "╯");
+    // строка подсказок под панелью: слева cwd, справа хоткеи (как в opencode)
+    void hints_row(std::string& f, int y, int x0, int w) {
+        f += "\033[" + std::to_string(y) + ";1H" + std::string((size_t)std::max(0, x0 - 1), ' ')
+           + dim(short_cwd()) + "\033[K";
+        std::string hints = paint("1", "ctrl+p") + dim(" " + L("команды", "commands"))
+            + "   " + paint("1", "ctrl+c") + dim(" " + L("прервать", "interrupt"));
+        int hw = visLen(hints);
+        int hx = x0 + w - hw; if (hx < 1) hx = 1;
+        f += "\033[" + std::to_string(y) + ";" + std::to_string(hx) + "H" + hints;
     }
 
-    void draw_chat() {
-        int sw = sidebarW();
-        int cw = contentW();
-        int bodyRows = rows - 1 - 4 - 1;
-        if (bodyRows < 1) bodyRows = 1;
-
-        std::vector<std::string> rowsv;
-        for (auto& m : msgs) for (auto& r : blockRows(m, cw)) rowsv.push_back(r);
-
-        std::string f = "\033[H\033[2J";
-        f += "\033[1;1H " + paint("1", "kinecode") + dim("  ·  " + g_status) + "\033[K";
-        int start = (int)rowsv.size() > bodyRows ? (int)rowsv.size() - bodyRows : 0;
-        int y = 2, used = 0;
-        for (int i = start; i < (int)rowsv.size() && used < bodyRows; i++, y++, used++) {
-            f += "\033[" + std::to_string(y) + ";1H" + rowsv[i] + "\033[K";
+    // статус-бар внизу: провайдер/модель/режим слева, версия и контекст справа
+    void status_bar(std::string& f, int y) {
+        std::string left, right;
+        bool hasP = pCfg && !pCfg->active_provider.empty() && !pCfg->active_model.empty();
+        if (hasP) {
+            left = green("✓") + " " + pCfg->active_provider + dim(" · " + pCfg->active_model)
+                 + dim("   " + L("агент: ", "agent: ")) + (pCfg ? pCfg->mode : "");
+        } else {
+            left = red("✗") + dim(" " + L("провайдер не настроен · ctrl+p → /settings",
+                                          "no provider yet · ctrl+p → /settings"));
         }
-        for (; used < bodyRows; used++, y++) f += "\033[" + std::to_string(y) + ";1H\033[K";
-
-        draw_input_box(f, rows - 4, cw, L(" Спроси что угодно… '/help'", " Ask anything… '/help'"));
-        f += "\033[" + std::to_string(rows) + ";1H" + dim(" " + footerText());
         if (g_ctx_tokens > 0) {
             char b[32]; snprintf(b, 32, "%ld tok", g_ctx_tokens);
-            f += "\033[" + std::to_string(rows) + ";" + std::to_string(cols - 12) + "H" + dim(b);
+            right += dim(std::string(b) + "  ·  ");
         }
-
-        if (sw > 0) {
-            int x = cols - sw + 1;
-            for (int yy = 1; yy <= rows; yy++)
-                f += "\033[" + std::to_string(yy) + ";" + std::to_string(x) + "H" + dim("│");
-            int sy = 2;
-            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + paint("1", L("Сессия", "Session"));
-            if (!sessionTitle.empty()) {
-                for (auto& t : wrap_ansi(sessionTitle, sw - 4))
-                    f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + dim(t);
-            }
-            sy++;
-            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + paint("1", L("Контекст", "Context"));
-            char b[64];
-            snprintf(b, 64, "%ld %s", g_ctx_tokens, L("токенов", "tokens"));
-            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + b;
-            sy++;
-            f += "\033[" + std::to_string(sy++) + ";" + std::to_string(x + 2) + "H" + dim(L("режим: ", "mode: ")) + pCfg->mode;
-        }
-        f += "\033[J";
-        wraw(f);
+        right += dim("v" + VERSION);
+        int rw = visLen(right);
+        int rx = cols - rw - 1; if (rx < 1) rx = 1;
+        f += "\033[" + std::to_string(y) + ";1H" + " " + left + "\033[K";
+        f += "\033[" + std::to_string(y) + ";" + std::to_string(rx) + "H" + right;
     }
 
+    void draw_splash(std::string& f) {
+        int lw = 62;
+        bool bigLogo = (cols - 2 >= lw);
+        int logoRows = bigLogo ? 6 : 1;
+        int pw = panelW();
+        int x0 = (cols - pw) / 2; if (x0 < 1) x0 = 1;
+        int total = logoRows + 1 + 1 + 1 + 3 + 1;   // логотип, пустая, подпись, пустая, панель, подсказки
+        int top = (rows - 1 - total) / 2; if (top < 2) top = 2;
+        if (bigLogo) {
+            for (int i = 0; i < 6; i++) {
+                int pad = (cols - lw) / 2; if (pad < 0) pad = 0;
+                f += "\033[" + std::to_string(top + i) + ";1H" + std::string((size_t)pad, ' ')
+                   + fg("240", LOGO[i]) + "\033[K";
+            }
+        } else {
+            std::string nm = paint("1", "kinecode");
+            int pad = (cols - 8) / 2; if (pad < 0) pad = 0;
+            f += "\033[" + std::to_string(top) + ";1H" + std::string((size_t)pad, ' ') + nm + "\033[K";
+        }
+        int y = top + logoRows + 1;
+        std::string sub = dim("harness · v" + VERSION);
+        int sp = (cols - (int)utf8_len(sub)) / 2; if (sp < 0) sp = 0;
+        f += "\033[" + std::to_string(y) + ";1H" + std::string((size_t)sp, ' ') + sub + "\033[K";
+        int py = y + 2;
+        curPanelY = py;
+        draw_panel(f, py, L("Спроси что угодно… '/help'", "Ask anything… '/help'"), pw);
+        hints_row(f, py + 3, x0, pw);
+        status_bar(f, rows);
+    }
+
+    void draw_chat(std::string& f) {
+        int pw = panelW();
+        int x0 = (cols - pw) / 2; if (x0 < 1) x0 = 1;
+        int panelTop = rows - 5;             // панель(3) + подсказки + статус
+        // верхняя строка: вкладка сессии (как табы opencode)
+        std::string title = sessionTitle.empty() ? L("Новый чат", "New session") : sessionTitle;
+        f += "\033[1;1H\033[48;5;235m " + clampVis(title, pw) + " \033[0m\033[K";
+        // лента сообщений
+        int bodyTop = 3, bodyBot = panelTop - 1;
+        int bodyRows = bodyBot - bodyTop + 1; if (bodyRows < 1) bodyRows = 1;
+        std::vector<std::string> rowsv;
+        for (auto& m : msgs) for (auto& r : blockRows(m, cols - 4)) rowsv.push_back(r);
+        int start = (int)rowsv.size() > bodyRows ? (int)rowsv.size() - bodyRows : 0;
+        int y = bodyTop;
+        for (int i = start; i < (int)rowsv.size() && y <= bodyBot; i++, y++)
+            f += "\033[" + std::to_string(y) + ";1H" + rowsv[i] + "\033[K";
+        for (; y <= bodyBot; y++) f += "\033[" + std::to_string(y) + ";1H\033[K";
+        // панель ввода + подсказки + статус
+        curPanelY = panelTop;
+        draw_panel(f, panelTop, L("Спроси что угодно… '/help'", "Ask anything… '/help'"), pw);
+        hints_row(f, panelTop + 3, x0, pw);
+        status_bar(f, rows);
+    }
+
+    // ---------- палитра команд в стиле opencode ----------
     struct PalItem { std::string cmd, desc; };
-    std::vector<PalItem> palItems() {
+    struct PalSection { std::string title; std::vector<PalItem> items; };
+    std::vector<PalSection> palSections() {
         return {
-            {"/help", L("помощь", "help")},
-            {"/settings", L("настройки: провайдеры, ключи, модели", "settings: providers, keys, models")},
-            {"/providers", L("список провайдеров", "list providers")},
-            {"/model", L("выбрать модель", "select model")},
-            {"/fetchmodels", L("обновить модели с сервера", "fetch models from server")},
-            {"/key", L("сменить API-ключ", "change API key")},
-            {"/mode", L("права доступа full|folder|read", "access mode full|folder|read")},
-            {"/cwd", L("рабочая папка агента", "agent workdir")},
-            {"/plugins", L("список плагинов", "list plugins")},
-            {"/system", L("системный промпт", "system prompt")},
-            {"/think", L("рассуждения on|off", "reasoning on|off")},
-            {"/language", L("язык ru|en", "language ru|en")},
-            {"/clear", L("очистить чат", "clear chat")},
-            {"/about", L("о программе", "about")},
-            {"/exit", L("выход", "quit")},
+            { L("Рекомендуемое", "Suggested"), {
+                { "/settings", L("провайдеры, ключи, модели", "providers, keys, models") },
+                { "/help",     L("все команды", "all commands") },
+            } },
+            { L("Провайдер", "Provider"), {
+                { "/providers",   L("список провайдеров", "list providers") },
+                { "/model",       L("выбрать модель", "select model") },
+                { "/fetchmodels", L("обновить модели", "fetch models") },
+                { "/key",         L("сменить API-ключ", "change API key") },
+            } },
+            { L("Агент", "Agent"), {
+                { "/mode",    L("права full|folder|read", "access full|folder|read") },
+                { "/cwd",     L("рабочая папка", "workdir") },
+                { "/plugins", L("плагины", "plugins") },
+                { "/system",  L("системный промпт", "system prompt") },
+                { "/think",   L("рассуждения on|off", "reasoning on|off") },
+            } },
+            { L("Сессия", "Session"), {
+                { "/clear",    L("очистить чат", "clear chat") },
+                { "/language", L("язык ru|en", "language ru|en") },
+                { "/about",    L("о программе", "about") },
+                { "/exit",     L("выход", "quit") },
+            } },
         };
     }
+    std::vector<PalItem> palVisible() {
+        std::vector<PalItem> out;
+        for (auto& s : palSections())
+            for (auto& it : s.items)
+                if (palFilter.empty() || it.cmd.find(palFilter) != std::string::npos
+                                     || it.desc.find(palFilter) != std::string::npos)
+                    out.push_back(it);
+        return out;
+    }
+    struct PalLine { bool header = false; std::string text; int item = -1; };
 
-    void draw_palette() {
-        auto items = palItems();
-        std::vector<PalItem> list;
-        for (auto& it : items)
-            if (palFilter.empty() || it.cmd.find(palFilter) != std::string::npos || it.desc.find(palFilter) != std::string::npos)
-                list.push_back(it);
-        if (palSel >= (int)list.size()) palSel = (int)list.size() - 1;
+    void draw_palette(std::string& f) {
+        auto vis = palVisible();
+        if (palSel >= (int)vis.size()) palSel = (int)vis.size() - 1;
         if (palSel < 0) palSel = 0;
 
-        int w = cols < 60 ? cols - 4 : 56;
-        int shown = rows - 9; if (shown > (int)list.size()) shown = (int)list.size(); if (shown < 1) shown = 1;
-        int h = shown + 5;
-        int top = (rows - h) / 2; if (top < 1) top = 1;
-        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
-
-        std::string border; for (int i = 0; i < w - 2; i++) border += "─";
-        std::string f = "\033[H\033[2J";
-        f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
-        auto row = [&](int y, const std::string& txt) {
-            std::string p = txt;
-            while (utf8_len(p) < (size_t)w - 4) p += " ";
-            if (utf8_len(p) > (size_t)w - 4) p = p.substr(0, w - 4);
-            f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + dim("│") + p + dim("│");
-        };
-        row(top + 1, paint("1", L(" Команды", " Commands")));
-        row(top + 2, dim(" " + (palFilter.empty() ? L("фильтр…", "filter…") : palFilter)));
-        row(top + 3, dim(" ────────────────────────────"));
-        for (int i = 0; i < shown; i++) {
-            int idx = (palSel / shown) * shown + i;
-            if (idx >= (int)list.size()) break;
-            std::string line = (idx == palSel ? paint("38;5;208", " ❯ ") : "   ") + list[idx].cmd + "  " + dim(list[idx].desc);
-            row(top + 4 + i, line);
+        std::vector<PalLine> lines;
+        if (palFilter.empty()) {
+            auto secs = palSections();
+            int idx = 0;
+            for (int si = 0; si < (int)secs.size(); si++) {
+                if (si) lines.push_back(PalLine{false, "", -1});
+                lines.push_back(PalLine{true, secs[si].title, -1});
+                for (auto& it : secs[si].items) { lines.push_back(PalLine{false, "", idx}); idx++; }
+            }
+        } else {
+            for (int i = 0; i < (int)vis.size(); i++) lines.push_back(PalLine{false, "", i});
         }
-        f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
-        f += "\033[J";
-        wraw(f);
+
+        int w = cols < 64 ? cols - 4 : 58;
+        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+        int avail = rows - 9; if (avail < 1) avail = 1;
+
+        int selLine = 0;
+        for (int i = 0; i < (int)lines.size(); i++)
+            if (lines[i].item == palSel) { selLine = i; break; }
+        int startL = 0;
+        if ((int)lines.size() > avail) {
+            startL = selLine - avail / 2;
+            if (startL < 0) startL = 0;
+            if (startL > (int)lines.size() - avail) startL = (int)lines.size() - avail;
+        }
+        int shown = std::min((int)lines.size(), avail);
+        int h = shown + 5;
+        int top = (rows - h) / 2; if (top < 2) top = 2;
+
+        {
+            std::string head = paint("1", L("Команды", "Commands"));
+            std::string esc = fg("90", "esc");
+            int gap = w - 4 - visLen(head) - visLen(esc); if (gap < 1) gap = 1;
+            modalRow(f, top, x0, w, head + std::string((size_t)gap, ' ') + esc);
+        }
+        modalRow(f, top + 1, x0, w, "");
+        if (palFilter.empty())
+            modalRow(f, top + 2, x0, w, fg("90", L("Поиск", "Search")));
+        else
+            modalRow(f, top + 2, x0, w, palFilter, false, "\033[48;5;238m");
+        modalRow(f, top + 3, x0, w, "");
+
+        for (int i = 0; i < shown; i++) {
+            const PalLine& ln = lines[startL + i];
+            int y = top + 4 + i;
+            if (ln.header) {
+                modalRow(f, y, x0, w, fg("38;5;140", ln.text));
+            } else if (ln.item >= 0 && ln.item < (int)vis.size()) {
+                const PalItem& it = vis[ln.item];
+                bool sel = (ln.item == palSel);
+                int innerW = w - 6;
+                std::string cmd = clampVis(it.cmd, innerW - 6);
+                std::string desc = clampVis(it.desc, innerW - (int)utf8_len(it.cmd) - 4);
+                int gap = innerW - (int)utf8_len(cmd) - (int)utf8_len(desc);
+                if (gap < 2) { desc.clear(); gap = innerW - (int)utf8_len(cmd); if (gap < 1) gap = 1; }
+                std::string right = desc.empty() ? std::string() : (sel ? desc : fg("90", desc));
+                modalRow(f, y, x0, w, cmd + std::string((size_t)gap, ' ') + right, sel);
+            } else {
+                modalRow(f, y, x0, w, "");
+            }
+        }
     }
 
     std::string run_palette() {
@@ -610,18 +740,14 @@ struct Tui {
             draw();
             int k = get_key();
             if (k == -2) continue;
+            auto vis = palVisible();
             if (k == 27) break;
             if (k == '\r' || k == '\n') {
-                auto items = palItems();
-                std::vector<PalItem> list;
-                for (auto& it : items)
-                    if (palFilter.empty() || it.cmd.find(palFilter) != std::string::npos || it.desc.find(palFilter) != std::string::npos)
-                        list.push_back(it);
-                if (palSel >= 0 && palSel < (int)list.size()) result = list[palSel].cmd;
+                if (palSel >= 0 && palSel < (int)vis.size()) result = vis[palSel].cmd;
                 break;
             }
             if (k == K_UP) { palSel--; if (palSel < 0) palSel = 0; continue; }
-            if (k == K_DOWN) { palSel++; continue; }
+            if (k == K_DOWN) { palSel++; if (palSel >= (int)vis.size()) palSel = (int)vis.size() - 1; continue; }
             if (k == 127 || k == 8) { utf8_pop(palFilter); palSel = 0; continue; }
             if (k >= 32) { palFilter += (char)k; palSel = 0; continue; }
         }
@@ -646,22 +772,24 @@ struct Tui {
         return result;
     }
 
-    void draw_dialog() {
-        int w = cols < 60 ? cols - 4 : 56;
-        int top = rows / 2 - 2; if (top < 1) top = 1;
+    void draw_dialog(std::string& f) {
+        int w = cols < 64 ? cols - 4 : 56;
         int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
-        std::string border; for (int i = 0; i < w - 2; i++) border += "─";
-        std::string f = "\033[2J";
-        f += "\033[" + std::to_string(top - 1) + ";1H" + paint("1", " " + dlgTitle);
-        f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
+        int h = 6;
+        int top = (rows - h) / 2; if (top < 2) top = 2;
+        std::string title = dlgTitle.empty() ? L("Ввод", "Input") : dlgTitle;
+        {
+            std::string head = paint("1", clampVis(title, w - 8));
+            std::string esc = fg("90", "esc");
+            int gap = w - 4 - visLen(head) - visLen(esc); if (gap < 1) gap = 1;
+            modalRow(f, top, x0, w, head + std::string((size_t)gap, ' ') + esc);
+        }
+        modalRow(f, top + 1, x0, w, "");
         std::string shown = dlgMask ? std::string(utf8_len(dlgValue), '*') : dlgValue;
-        std::string pad = shown;
-        while (utf8_len(pad) < (size_t)w - 4) pad += " ";
-        f += "\033[" + std::to_string(top + 1) + ";" + std::to_string(x0) + "H" + dim("│") + " " + pad + dim("│");
-        f += "\033[" + std::to_string(top + 2) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
-        f += "\033[" + std::to_string(top + 4) + ";1H" + dim(L(" Enter — ок · Esc — отмена", " Enter — ok · Esc — cancel"));
-        f += "\033[J";
-        wraw(f);
+        while ((int)utf8_len(shown) > w - 8) utf8_pop(shown);
+        modalRow(f, top + 2, x0, w, shown, false, "\033[48;5;238m");
+        modalRow(f, top + 3, x0, w, "");
+        modalRow(f, top + 4, x0, w, fg("90", L("Enter — ок · Esc — отмена", "Enter — ok · Esc — cancel")));
     }
 
     std::vector<std::string> providerNames(Config& cfg) {
@@ -736,38 +864,47 @@ struct Tui {
         return true;
     }
 
+    void draw_wizard(std::string& f) {
+        int w = cols < 64 ? cols - 4 : 58;
+        int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+        int avail = rows - 8; if (avail < 1) avail = 1;
+        int n = (int)wizOpts.size();
+        int start = 0;
+        if (n > avail) { start = wizSel - avail / 2; if (start < 0) start = 0; if (start > n - avail) start = n - avail; }
+        int shown = std::min(n, avail);
+        int h = shown + 5;
+        int top = (rows - h) / 2; if (top < 2) top = 2;
+        {
+            std::string head = paint("1", clampVis(wizTitle, w - 8));
+            std::string esc = fg("90", "esc");
+            int gap = w - 4 - visLen(head) - visLen(esc); if (gap < 1) gap = 1;
+            modalRow(f, top, x0, w, head + std::string((size_t)gap, ' ') + esc);
+        }
+        modalRow(f, top + 1, x0, w, "");
+        for (int i = 0; i < shown; i++) {
+            int idx = start + i;
+            bool sel = (idx == wizSel);
+            modalRow(f, top + 2 + i, x0, w, clampVis(wizOpts[idx], w - 8), sel);
+        }
+        modalRow(f, top + h - 1, x0, w, fg("90", L("Enter — выбрать · Esc — отмена", "Enter — select · Esc — cancel")));
+    }
+
     void wizard(Config& cfg) {
         std::vector<std::string> opts;
         for (auto& [n, p] : PRESETS) opts.push_back(n + "  ·  " + p.second);
         opts.push_back(L("другое (свой base_url)", "custom (own base_url)"));
-        int sel = 0;
+        wizOpen = true; wizTitle = L("Добавить провайдера", "Add provider"); wizOpts = opts; wizSel = 0;
         for (;;) {
-            int w = cols < 60 ? cols - 4 : 56;
-            int h = (int)opts.size() + 4;
-            int top = (rows - h) / 2; if (top < 1) top = 1;
-            int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
-            std::string border; for (int i = 0; i < w - 2; i++) border += "─";
-            std::string f = "\033[2J";
-            f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
-            auto row = [&](int y, const std::string& txt) {
-                std::string p = txt;
-                while (utf8_len(p) < (size_t)w - 4) p += " ";
-                f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + dim("│") + p + dim("│");
-            };
-            row(top + 1, paint("1", " " + L("Добавить провайдера", "Add provider")));
-            for (int i = 0; i < (int)opts.size(); i++) {
-                row(top + 2 + i, (i == sel ? paint("38;5;208", " ❯ ") : "   ") + opts[i]);
-            }
-            f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
-            f += "\033[J";
-            wraw(f);
+            draw();
             int k = get_key();
             if (k == -2) continue;
-            if (k == 27) return;
-            if (k == K_UP && sel > 0) sel--;
-            if (k == K_DOWN && sel < (int)opts.size() - 1) sel++;
+            if (k == 27) { wizOpen = false; return; }
+            if (k == K_UP && wizSel > 0) wizSel--;
+            if (k == K_DOWN && wizSel < (int)wizOpts.size() - 1) wizSel++;
             if (k == '\r' || k == '\n') break;
         }
+        wizOpen = false;
+        int sel = wizSel;
         bool custom = (sel == (int)opts.size() - 1);
         std::string name, url;
         if (!custom) {
@@ -797,65 +934,132 @@ struct Tui {
             : L("добавлен, моделей: ", "added, models: ") + std::to_string(ids.size());
     }
 
-    void draw_settings(Config& cfg) {
-        int w = cols < 64 ? cols - 4 : 60;
+    void draw_settings(std::string& f) {
+        Config& cfg = *pCfg;
+        int w = cols < 64 ? cols - 4 : 58;
         int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
-        std::string border; for (int i = 0; i < w - 2; i++) border += "─";
-        std::string f = "\033[2J";
-        auto row = [&](int y, const std::string& txt) {
-            std::string p = txt;
-            while (utf8_len(p) < (size_t)w - 4) p += " ";
-            f += "\033[" + std::to_string(y) + ";" + std::to_string(x0) + "H" + dim("│") + p + dim("│");
-        };
+        int innerW = w - 6;
         auto names = providerNames(cfg);
+        auto modalHeader = [&](int top, const std::string& title) {
+            std::string head = paint("1", clampVis(title, w - 10));
+            std::string esc = fg("90", "esc");
+            int gap = w - 4 - visLen(head) - visLen(esc); if (gap < 1) gap = 1;
+            modalRow(f, top, x0, w, head + std::string((size_t)gap, ' ') + esc);
+        };
         if (setPage == 0) {
-            int h = (int)names.size() + 8;
-            int top = (rows - h) / 2; if (top < 1) top = 1;
-            f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
-            row(top + 1, paint("1", " " + L("Настройки", "Settings")));
-            row(top + 2, dim(" " + L("Enter — модели · a — добавить · d — удалить · m — режим · w — папка", "Enter — models · a — add · d — delete · m — mode · w — workdir")));
-            row(top + 3, dim(" ──────────────────────────────"));
-            if (names.empty()) row(top + 4, dim(" " + L("пусто — нажми a", "empty — press a")));
-            for (int i = 0; i < (int)names.size(); i++) {
-                auto& p = cfg.providers[names[i]];
-                std::string key = ::get_key(names[i], p).empty() ? red(L("нет ключа", "no key")) : green(L("ключ есть", "key set"));
-                std::string act = (names[i] == cfg.active_provider) ? paint("38;5;208", "●") : " ";
-                row(top + 4 + i, (i == setSel ? paint("38;5;208", " ❯ ") : "   ") + act + " " + names[i] + "  " + key);
+            int avail = rows - 11; if (avail < 1) avail = 1;
+            int n = (int)names.size();
+            int start = 0;
+            if (n > avail) { start = setSel - avail / 2; if (start < 0) start = 0; if (start > n - avail) start = n - avail; }
+            int shown = std::min(n, avail);
+            int top = (rows - (shown + 8)) / 2; if (top < 2) top = 2;
+            modalHeader(top, L("Настройки", "Settings"));
+            modalRow(f, top + 1, x0, w, "");
+            if (names.empty())
+                modalRow(f, top + 2, x0, w, fg("90", L("пусто — нажми a, чтобы добавить", "empty — press a to add")));
+            for (int i = 0; i < shown; i++) {
+                int idx = start + i;
+                auto& p = cfg.providers[names[idx]];
+                bool sel = (idx == setSel);
+                bool active = (names[idx] == cfg.active_provider);
+                bool hasKey = !::get_key(names[idx], p).empty();
+                std::string st = hasKey ? L("ключ есть", "key set") : L("нет ключа", "no key");
+                int gap = innerW - 2 - (int)utf8_len(names[idx]) - (int)utf8_len(st);
+                if (gap < 2) { st.clear(); gap = innerW - 2 - (int)utf8_len(names[idx]); if (gap < 1) gap = 1; }
+                std::string content;
+                if (sel) {
+                    content = std::string(active ? "● " : "  ") + names[idx] + std::string((size_t)gap, ' ') + st;
+                } else {
+                    content = (active ? fg("38;5;33", "●") : std::string(" ")) + " " + names[idx]
+                            + std::string((size_t)gap, ' ')
+                            + (hasKey ? fg("38;5;108", st) : fg("38;5;203", st));
+                }
+                modalRow(f, top + 2 + i, x0, w, clampVis(content, innerW), sel);
             }
-            int ly = top + 4 + (int)names.size();
+            int ly = top + 2 + shown;
             std::string wd = cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir;
-            row(ly, dim(" " + L("режим: ", "mode: ")) + cfg.mode + dim("  ·  " + wd));
-            row(ly + 1, dim(" " + (statusMsg.empty() ? L("Esc — закрыть", "Esc — close") : statusMsg)));
-            f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+            modalRow(f, ly, x0, w, fg("90", clampVis(L("режим: ", "mode: ") + cfg.mode + "  ·  " + wd, innerW)));
+            modalRow(f, ly + 1, x0, w,
+                     fg(statusMsg.empty() ? "90" : "38;5;180",
+                        clampVis(statusMsg.empty()
+                            ? L("enter — модели · a — добавить · d — удалить · m — режим · w — папка",
+                                "enter — models · a — add · d — delete · m — mode · w — workdir")
+                            : statusMsg, innerW)));
         } else {
-            if (cfg.providers.count(providerPage) == 0) { f += "\033[J"; wraw(f); return; }
+            if (cfg.providers.count(providerPage) == 0) return;
             auto& p = cfg.providers[providerPage];
-            int h = (int)p.models.size() + 7;
-            int top = (rows - h) / 2; if (top < 1) top = 1;
-            f += "\033[" + std::to_string(top) + ";" + std::to_string(x0) + "H" + dim("╭" + border + "╮");
-            row(top + 1, paint("1", " " + providerPage + " · " + (cfg.active_provider == providerPage && !cfg.active_model.empty() ? cfg.active_model : "—")));
-            row(top + 2, dim(" " + L("Enter — выбрать · f — обновить · a — добавить модель", "Enter — select · f — fetch · a — add model")));
-            row(top + 3, dim(" ──────────────────────────────"));
-            if (p.models.empty()) row(top + 4, dim(" " + L("моделей нет — нажми f", "no models — press f")));
-            for (int i = 0; i < (int)p.models.size(); i++) {
-                std::string act = (p.models[i] == cfg.active_model && providerPage == cfg.active_provider) ? paint("38;5;208", "●") : " ";
-                row(top + 4 + i, (i == setModelSel ? paint("38;5;208", " ❯ ") : "   ") + act + " " + p.models[i]);
+            int avail = rows - 10; if (avail < 1) avail = 1;
+            int n = (int)p.models.size();
+            int start = 0;
+            if (n > avail) { start = setModelSel - avail / 2; if (start < 0) start = 0; if (start > n - avail) start = n - avail; }
+            int shown = std::min(n, avail);
+            int top = (rows - (shown + 7)) / 2; if (top < 2) top = 2;
+            modalHeader(top, providerPage);
+            modalRow(f, top + 1, x0, w, "");
+            if (p.models.empty())
+                modalRow(f, top + 2, x0, w, fg("90", L("моделей нет — нажми f", "no models — press f")));
+            for (int i = 0; i < shown; i++) {
+                int idx = start + i;
+                bool sel = (idx == setModelSel);
+                bool active = (p.models[idx] == cfg.active_model && providerPage == cfg.active_provider);
+                std::string content;
+                if (sel) content = std::string(active ? "● " : "  ") + p.models[idx];
+                else content = (active ? fg("38;5;33", "●") : std::string(" ")) + " " + p.models[idx];
+                modalRow(f, top + 2 + i, x0, w, clampVis(content, innerW), sel);
             }
-            row(top + h - 2, dim(" " + (statusMsg.empty() ? L("Esc — назад", "Esc — back") : statusMsg)));
-            f += "\033[" + std::to_string(top + h - 1) + ";" + std::to_string(x0) + "H" + dim("╰" + border + "╯");
+            int ly = top + 2 + shown;
+            modalRow(f, ly, x0, w,
+                     fg(statusMsg.empty() ? "90" : "38;5;180",
+                        clampVis(statusMsg.empty()
+                            ? L("enter — выбрать · f — обновить · a — добавить модель",
+                                "enter — select · f — fetch · a — add model")
+                            : statusMsg, innerW)));
         }
-        f += "\033[J";
-        wraw(f);
+    }
+
+    std::string base_screen() {
+        std::string f = "";
+        if (msgs.empty()) draw_splash(f); else draw_chat(f);
+        return f;
     }
 
     void draw() {
         if (!active) return;
         tui_size(rows, cols);
         if (cols < 20 || rows < 6) return;
-        if (dlgOpen) { draw_dialog(); return; }
-        if (palOpen) { draw_palette(); return; }
-        if (setOpen && pCfg) { draw_settings(*pCfg); return; }
-        if (msgs.empty()) draw_splash(); else draw_chat();
+        bool modal = dlgOpen || palOpen || wizOpen || (setOpen && pCfg);
+        std::string mode = dlgOpen ? "dlg" : palOpen ? "pal" : wizOpen ? "wiz"
+                         : (setOpen && pCfg) ? "set" : (msgs.empty() ? "splash" : "chat");
+        std::string key = mode + "@" + std::to_string(rows) + "x" + std::to_string(cols);
+        bool clear = (key != lastFrameKey);
+        lastFrameKey = key;
+        std::string f = clear ? "\033[H\033[2J" : "\033[H";
+        if (msgs.empty()) draw_splash(f); else draw_chat(f);
+        if (dlgOpen)      draw_dialog(f);
+        else if (palOpen) draw_palette(f);
+        else if (wizOpen) draw_wizard(f);
+        else if (setOpen && pCfg) draw_settings(f);
+        f += "\033[J";
+        if (dlgOpen) {
+            int w = cols < 64 ? cols - 4 : 56;
+            int x0 = (cols - w) / 2; if (x0 < 1) x0 = 1;
+            int top = (rows - 6) / 2; if (top < 2) top = 2;
+            std::string shown = dlgMask ? std::string(utf8_len(dlgValue), '*') : dlgValue;
+            while ((int)utf8_len(shown) > w - 8) utf8_pop(shown);
+            f += "\033[" + std::to_string(top + 2) + ";" + std::to_string(x0 + 3 + utf8_len(shown)) + "H";
+        } else if (modal) {
+            f += "\033[?25l\033[H";
+        } else {
+            f += "\033[?25h";
+            if (curPanelY > 0) {
+                int pw = panelW(); int x0 = (cols - pw) / 2; if (x0 < 1) x0 = 1;
+                int dw = utf8_len(input); if (dw > pw - 8) dw = pw - 8;
+                f += "\033[" + std::to_string(curPanelY) + ";" + std::to_string(x0 + 3 + dw) + "H";
+            } else {
+                f += "\033[H";
+            }
+        }
+        wraw(f);
     }
 
     int get_key() {
@@ -1053,7 +1257,7 @@ CurlResponse http_get(const std::string& url, const std::string& key) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.5");
+    headers = curl_slist_append(headers, ("User-Agent: kinecode/" + VERSION).c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status);
@@ -1079,7 +1283,7 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.5");
+    headers = curl_slist_append(headers, ("User-Agent: kinecode/" + VERSION).c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     StreamState st{on_chunk, "", show_think};
@@ -1677,9 +1881,11 @@ int tui_main(Config& cfg) {
             if (nl != std::string::npos) tui.sessionTitle = tui.sessionTitle.substr(0, nl);
             if (tui.sessionTitle.size() > 34) tui.sessionTitle = tui.sessionTitle.substr(0, 34) + "…";
         }
-        bool cont = handle_command(cfg, line, messages, show_think);
+        bool cont = (line[0] == '/')
+            ? handle_command(cfg, line, messages, show_think)
+            : (cmd_send(cfg, line, messages, show_think), true);
         std::cout.flush();
-                tui.draw();
+        tui.draw();
         if (!cont) break;
     }
 
@@ -1702,6 +1908,7 @@ int main() {
     bool tty_in = isatty(STDIN_FILENO) != 0;
 #endif
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    migrate_old_config();
     Config cfg = load_config();
     try { fs::create_directories(conf_dir()); } catch (...) {}
 
