@@ -57,30 +57,6 @@ jobs:
           name: kinecode-windows
           path: kinecode.exe
 
-  appimage:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev libreadline-dev pkg-config
-      - name: build
-        run: g++ -std=c++17 -O2 $(pkg-config --cflags libcurl) -o kinecode-linux kinecode.cpp $(pkg-config --libs libcurl) -lreadline
-      - name: package appimage
-        run: |
-          set -e
-          wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy-x86_64.AppImage
-          ./linuxdeploy-x86_64.AppImage --appimage-extract >/dev/null
-          mkdir -p AppDir/usr/bin
-          cp kinecode-linux AppDir/usr/bin/kinecode
-          ./squashfs-root/AppRun --appdir AppDir -d kinecode.desktop -i icon.png --output appimage
-          ls *.AppImage
-          mv $(ls kinecode-*.AppImage | head -1) kinecode-x86_64.AppImage
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kinecode-appimage
-          path: kinecode-x86_64.AppImage
-
   windows-sign:
     needs: windows
     runs-on: ubuntu-latest
@@ -114,7 +90,7 @@ jobs:
           path: signed/kinecode.exe
 
   release:
-    needs: [linux, windows, appimage, windows-sign]
+    needs: [linux, windows, windows-sign]
     if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
@@ -123,10 +99,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: kinecode-linux
-          path: .
-      - uses: actions/download-artifact@v4
-        with:
-          name: kinecode-appimage
           path: .
       - uses: actions/download-artifact@v4
         with:
@@ -150,6 +122,5 @@ jobs:
         with:
           files: |
             kinecode-linux
-            kinecode-x86_64.AppImage
             kinecode.exe
           generate_release_notes: true

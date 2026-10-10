@@ -25,15 +25,6 @@ curl -fsSL https://raw.githubusercontent.com/fawwelll/kinecode/main/install.sh |
 
 The installer downloads the binary, makes it executable and puts it in `~/.local/bin/kinecode` (already in PATH on most distros). Then just type `kinecode`.
 
-### Linux — AppImage (double-click)
-
-Download **`kinecode-x86_64.AppImage`** — all libraries are bundled, it opens on almost any distro (Debian, Ubuntu, Arch, Fedora, Mint, ...). In Dolphin/Nautilus double-clicking it offers *"Run"* — no chmod, no terminal needed. From a terminal:
-
-```bash
-chmod +x kinecode-x86_64.AppImage
-./kinecode-x86_64.AppImage
-```
-
 ### Linux — plain binary
 
 Download **`kinecode-linux`** (Debian, Ubuntu, Arch, Fedora — any x86_64 distro). A downloaded file is not executable by default — this is standard Linux behavior, not a bug:
