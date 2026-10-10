@@ -20,6 +20,7 @@ signing certificate.
 
 ## Features
 
+- **Full-screen TUI** — clean interface with ASCII banner, message log, input box, history (↑/↓), `Ctrl+C` interrupt. Runs automatically in a terminal; plain console mode for pipes/scripts
 - **Multi-provider** — switch between APIs on the fly
 - **Streaming** — real-time token-by-token output
 - **Reasoning support** — shows/hides model thinking process (`/think on|off`)
@@ -27,7 +28,7 @@ signing certificate.
 - **Image upload** — send photos for vision models (`/img <path>`)
 - **Language switch** — `/language ru|en`
 - **Config persistence** — providers, keys, and history saved locally
-- **Zero bloat** — single binary, ~400KB
+- **Zero bloat** — single binary, no frameworks
 
 ## Build
 

@@ -19,7 +19,11 @@
 #else
 #include <termios.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <csignal>
 #endif
+#include <chrono>
 #include <curl/curl.h>
 #include "nlohmann/json.hpp"
 
@@ -27,7 +31,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.3.1";
+const std::string VERSION = "0.4";
 
 int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
@@ -227,6 +231,314 @@ std::string getpass_cpp(const std::string& prompt) {
     return pass;
 }
 
+// ---------- TUI ----------
+
+volatile bool g_interrupt = false;
+std::string g_status;
+bool tui_mask = false;
+
+enum { K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_DEL, K_IGNORE };
+
+#ifdef _WIN32
+DWORD g_orig_inmode = 0;
+void tui_raw(bool on) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (on) {
+        GetConsoleMode(h, &g_orig_inmode);
+        SetConsoleMode(h, g_orig_inmode & ~(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT));
+    } else SetConsoleMode(h, g_orig_inmode);
+}
+void tui_size(int& r, int& c) {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        c = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        r = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    }
+}
+bool tui_key_avail(int ms) { (void)ms; return _kbhit() != 0; }
+int tui_read_byte() { return _getch(); }
+#else
+termios g_orig_termios;
+void tui_raw(bool on) {
+    termios t;
+    if (on) {
+        tcgetattr(0, &t);
+        g_orig_termios = t;
+        t.c_lflag &= ~(ICANON | ECHO | ISIG);
+        t.c_oflag &= ~OPOST;
+        t.c_cc[VMIN] = 1; t.c_cc[VTIME] = 0;
+        tcsetattr(0, TCSANOW, &t);
+    } else tcsetattr(0, TCSANOW, &g_orig_termios);
+}
+void tui_size(int& r, int& c) {
+    winsize w;
+    if (ioctl(1, TIOCGWINSZ, &w) == 0 && w.ws_row > 0) { r = w.ws_row; c = w.ws_col; }
+}
+bool tui_key_avail(int ms) { pollfd p{0, POLLIN, 0}; return poll(&p, 1, ms) > 0; }
+int tui_read_byte() { unsigned char c; if (read(0, &c, 1) != 1) return -1; return c; }
+#endif
+
+static void wraw(const std::string& s) {
+    if (!s.empty()) { fwrite(s.data(), 1, s.size(), stdout); fflush(stdout); }
+}
+
+struct Tui {
+    bool active = false;
+    int rows = 24, cols = 80;
+    std::vector<std::string> log;
+    std::string partial;
+    std::string input;
+    std::vector<std::string> history;
+    int hist_idx = 0;
+    std::chrono::steady_clock::time_point last_draw;
+
+    void feed(const std::string& s) {
+        for (char ch : s) {
+            if (ch == '\n') { log.push_back(partial); partial.clear(); }
+            else partial += ch;
+        }
+        maybe_draw();
+    }
+    void maybe_draw() {
+        if (!active) return;
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_draw).count() < 30) return;
+        last_draw = now;
+        draw();
+    }
+    void flush_partial() { if (!partial.empty()) { log.push_back(partial); partial.clear(); } }
+
+    std::vector<std::string> build_header() {
+        std::vector<std::string> h;
+        std::vector<std::string> lines;
+        std::string b = BANNER;
+        size_t pos = 0;
+        while (pos <= b.size()) {
+            size_t nl = b.find('\n', pos);
+            if (nl == std::string::npos) { if (pos < b.size()) lines.push_back(b.substr(pos)); break; }
+            lines.push_back(b.substr(pos, nl - pos));
+            pos = nl + 1;
+        }
+        while (!lines.empty() && lines.back().find_first_not_of(" ") == std::string::npos) lines.pop_back();
+        while (!lines.empty() && lines.front().find_first_not_of(" ") == std::string::npos) lines.erase(lines.begin());
+        if (cols >= 62 && rows >= 24) {
+            for (size_t i = 0; i < lines.size(); i++) {
+                if (i < 6) h.push_back(paint("38;5;208", lines[i]));
+                else h.push_back(dim(lines[i]));
+            }
+        } else if (cols >= 24) {
+            h.push_back(paint("38;5;208", " ______  _____ _____ ___________ _____"));
+            h.push_back(paint("38;5;208", "|  _  \\/  ___/  __ \\  _  |  _  \\  ___|"));
+            h.push_back(dim(" kinecode"));
+        } else {
+            h.push_back(paint("38;5;208", "kinecode"));
+        }
+        h.push_back(dim(" " + g_status));
+        return h;
+    }
+
+    void draw() {
+        if (!active) return;
+        tui_size(rows, cols);
+        if (cols < 20 || rows < 6) return;
+        auto header = build_header();
+        int body = rows - (int)header.size() - 3;
+        if (body < 1) body = 1;
+
+        std::vector<std::string> all = log;
+        if (!partial.empty()) all.push_back(partial);
+        std::vector<std::string> rowsv;
+        for (auto& l : all) for (auto& r : wrap_ansi(l, cols - 1)) rowsv.push_back(r);
+
+        std::string f = "\033[H";
+        for (auto& h : header) f += h + "\033[K\r\n";
+        int start = (int)rowsv.size() > body ? (int)rowsv.size() - body : 0;
+        int used = 0;
+        for (int i = start; i < (int)rowsv.size() && used < body; i++, used++)
+            f += rowsv[i] + "\033[K\r\n";
+        for (; used < body; used++) f += "\033[K\r\n";
+        std::string sep;
+        for (int i = 0; i < cols - 2 && i < 200; i++) sep += "─";
+        f += dim(sep) + "\033[K\r\n";
+        std::string shown;
+        if (tui_mask) shown.assign(utf8_len(input), '*'); else shown = input;
+        f += paint("38;5;208", " ❯ ") + shown + "\033[K\r\n";
+        f += dim(" /help · Ctrl+C " + std::string(L("- прервать", "- interrupt")) + " · /exit") + "\033[K";
+        f += "\033[J";
+        wraw(f);
+    }
+
+    static size_t utf8_len(const std::string& s) {
+        size_t n = 0;
+        for (size_t i = 0; i < s.size(); ) {
+            unsigned char c = s[i];
+            i += (c < 0x80) ? 1 : ((c >> 5) == 6 ? 2 : ((c >> 4) == 14 ? 3 : 4));
+            n++;
+        }
+        return n;
+    }
+    static void utf8_pop(std::string& s) {
+        while (!s.empty() && ((unsigned char)s.back() & 0xC0) == 0x80) s.pop_back();
+        if (!s.empty()) s.pop_back();
+    }
+    static std::vector<std::string> wrap_ansi(const std::string& s, int width) {
+        if (width < 8) width = 8;
+        std::vector<std::string> out;
+        std::string cur, sgr;
+        int w = 0;
+        for (size_t i = 0; i < s.size(); ) {
+            if (s[i] == '\033') {
+                size_t j = i;
+                while (j < s.size() && s[j] != 'm') j++;
+                if (j < s.size()) {
+                    std::string seq = s.substr(i, j - i + 1);
+                    cur += seq;
+                    if (seq == "\033[0m") sgr.clear(); else sgr = seq;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            unsigned char c = s[i];
+            int len = (c < 0x80) ? 1 : ((c >> 5) == 6 ? 2 : ((c >> 4) == 14 ? 3 : 4));
+            if (c == '\n') { out.push_back(cur); cur = sgr; w = 0; i++; continue; }
+            if (w + 1 > width) { out.push_back(cur); cur = sgr; w = 0; }
+            cur += s.substr(i, len);
+            w++; i += len;
+        }
+        out.push_back(cur);
+        return out;
+    }
+
+    int get_key() {
+#ifdef _WIN32
+        while (!tui_key_avail(0)) Sleep(40);
+        int c = tui_read_byte();
+        if (c == 224 || c == 0) {
+            c = tui_read_byte();
+            switch (c) { case 72: return K_UP; case 80: return K_DOWN; case 75: return K_LEFT; case 77: return K_RIGHT; case 83: return K_DEL; default: return K_IGNORE; }
+        }
+        return c;
+#else
+        for (;;) {
+            pollfd p{0, POLLIN, 0};
+            int pr = poll(&p, 1, 250);
+            if (pr == 0) return -2;
+            if (pr < 0) continue;
+            unsigned char c;
+            if (read(0, &c, 1) != 1) return -1;
+            if (c != 27) return c;
+            pollfd p2{0, POLLIN, 0};
+            if (poll(&p2, 1, 30) <= 0) return 27;
+            if (read(0, &c, 1) != 1) return K_IGNORE;
+            if (c != '[') return K_IGNORE;
+            pollfd p3{0, POLLIN, 0};
+            if (poll(&p3, 1, 30) <= 0) return K_IGNORE;
+            if (read(0, &c, 1) != 1) return K_IGNORE;
+            switch (c) {
+                case 'A': return K_UP;
+                case 'B': return K_DOWN;
+                case 'C': return K_RIGHT;
+                case 'D': return K_LEFT;
+                case '3': { pollfd p4{0, POLLIN, 0}; if (poll(&p4, 1, 30) > 0) { unsigned char t; read(0, &t, 1); } return K_DEL; }
+                default: return K_IGNORE;
+            }
+        }
+#endif
+    }
+
+    std::string read_line() {
+        input.clear();
+        hist_idx = (int)history.size();
+        for (;;) {
+            draw();
+            int k = get_key();
+            if (k == -2) continue;
+            if (k == -1 || k == 4) return "\x04";
+            if (k == 3) {
+                if (!input.empty()) { input.clear(); continue; }
+                g_interrupt = true;
+                return "\x04";
+            }
+            if (k == '\r' || k == '\n') {
+                std::string v = input;
+                input.clear();
+                if (!v.empty()) history.push_back(v);
+                hist_idx = (int)history.size();
+                return v;
+            }
+            if (k == 127 || k == 8) { utf8_pop(input); continue; }
+            if (k == 21) { input.clear(); continue; }
+            if (k == K_UP) { if (hist_idx > 0) { hist_idx--; input = history[hist_idx]; } continue; }
+            if (k == K_DOWN) {
+                if (hist_idx < (int)history.size() - 1) { hist_idx++; input = history[hist_idx]; }
+                else { hist_idx = (int)history.size(); input.clear(); }
+                continue;
+            }
+            if (k == K_LEFT || k == K_RIGHT || k == K_DEL || k == K_IGNORE) continue;
+            if (k >= 32) { input += (char)k; continue; }
+        }
+    }
+
+    void enter() { tui_raw(true); wraw("\033[?1049h\033[H\033[2J"); }
+    void leave() { wraw("\033[?1049l\033[?25h"); tui_raw(false); active = false; }
+    void update_status(const Config& cfg) {
+        g_status = "v" + VERSION + " · " +
+            (cfg.active_provider.empty() ? std::string("—") : cfg.active_provider) + "/" +
+            (cfg.active_model.empty() ? std::string("—") : cfg.active_model);
+    }
+};
+
+Tui tui;
+
+struct LogBuf : std::stringbuf {
+    int sync() override {
+        std::string s = str();
+        str("");
+        tui.feed(s);
+        return 0;
+    }
+};
+
+std::string ask_line(bool secret = false) {
+    if (tui.active) {
+        std::cout.flush();
+        tui_mask = secret;
+        std::string v = tui.read_line();
+        tui_mask = false;
+        std::string p = tui.partial;
+        tui.partial.clear();
+        if (v == "\x04") return "";
+        tui.log.push_back(p + (secret ? std::string(Tui::utf8_len(v), '*') : v));
+        return v;
+    }
+    std::string v;
+    std::getline(std::cin, v);
+    return v;
+}
+
+std::string ask_secret(const std::string& prompt) {
+    if (tui.active) {
+        std::cout.flush();
+        std::string p = tui.partial;
+        tui.partial.clear();
+        tui_mask = true;
+        std::string v = tui.read_line();
+        tui_mask = false;
+        if (v == "\x04") return "";
+        tui.log.push_back(p + std::string(Tui::utf8_len(v), '*'));
+        return v;
+    }
+    return getpass_cpp(prompt);
+}
+
+void tui_poll_interrupt() {
+    if (!tui.active) return;
+    while (tui_key_avail(0)) {
+        int c = tui_read_byte();
+        if (c == 3) g_interrupt = true;
+    }
+}
+
 struct CurlResponse {
     long status = 0;
     std::string body;
@@ -294,7 +606,7 @@ CurlResponse http_get(const std::string& url, const std::string& key) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3.1");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status);
@@ -313,11 +625,14 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+        [](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int { return g_interrupt ? 1 : 0; });
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3.1");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.4");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     StreamState st{on_chunk, "", show_think};
@@ -360,8 +675,7 @@ int choose_item(const std::vector<std::string>& items, const std::string& curren
         std::cout << " " << mark << " " << (i + 1) << ". " << items[i] << "\n";
     }
     std::cout << dim(L("номер (Enter - отмена): ", "number (Enter - cancel): "));
-    std::string ans;
-    std::getline(std::cin, ans);
+    std::string ans = ask_line();
     int n = 0;
     try { n = std::stoi(ans); } catch (...) {}
     if (n >= 1 && n <= (int)items.size()) return n - 1;
@@ -411,10 +725,14 @@ void cmd_send(Config& cfg, const std::string& text,
                 answer += piece;
             }
             std::cout.flush();
+            tui_poll_interrupt();
         });
+    bool interrupted = g_interrupt;
+    g_interrupt = false;
 
     std::cout << "\n";
-    if (!ok) {
+    if (interrupted) std::cout << dim(L("[прервано]", "[interrupted]")) << "\n";
+    if (!ok && !interrupted) {
         std::cerr << red(L("Ошибка сети", "Network error")) << "\n";
         messages.pop_back();
         return;
@@ -550,13 +868,14 @@ bool handle_command(Config& cfg, const std::string& line,
         if (!ids.empty()) { p->models = ids; save_config(cfg); std::cout << green(L("Моделей: ", "Models: ") + std::to_string(ids.size())) << "\n"; }
     } else if (cmd == "addprovider") {
         std::string name = arg;
-        if (name.empty()) { std::cout << L("Имя: ", "Name: "); std::getline(std::cin, name); }
+        if (name.empty()) { std::cout << L("Имя: ", "Name: "); name = ask_line(); }
         if (name.empty()) return true;
         std::cout << "base_url: ";
-        std::string url; std::getline(std::cin, url);
+        std::string url = ask_line();
         if (url.empty()) { std::cerr << red(L("base_url обязателен\n", "base_url required\n")); return true; }
         while (!url.empty() && url.back() == '/') url.pop_back();
-        std::string key = getpass_cpp(L("API-ключ (скрыт): ", "API key (hidden): "));
+        std::cout << L("API-ключ (скрыт): ", "API key (hidden): ");
+        std::string key = ask_secret("");
         Provider p; p.base_url = url; p.key = key;
         cfg.providers[name] = p;
         auto ids = fetch_models(name, p);
@@ -574,7 +893,8 @@ bool handle_command(Config& cfg, const std::string& line,
     } else if (cmd == "key") {
         std::string name = arg.empty() ? cfg.active_provider : arg;
         if (!cfg.providers.count(name)) { std::cerr << red(L("Нет такого\n", "Not found\n")); return true; }
-        cfg.providers[name].key = getpass_cpp(L("Новый ключ: ", "New key: "));
+        std::cout << L("Новый ключ: ", "New key: ");
+        cfg.providers[name].key = ask_secret("");
         save_config(cfg);
         std::cout << green(L("Сохранён", "Saved")) << "\n";
     } else if (cmd == "system") {
@@ -585,6 +905,7 @@ bool handle_command(Config& cfg, const std::string& line,
         std::cout << dim(show_think ? L("Рассуждения: показываю", "Reasoning: shown") : L("Рассуждения: скрыты", "Reasoning: hidden")) << "\n";
     } else if (cmd == "clear") {
         messages.clear();
+        if (tui.active) { tui.log.clear(); tui.partial.clear(); }
         std::cout << dim(L("Диалог очищен", "Chat cleared")) << "\n";
     } else if (cmd == "file") {
         auto [path, question] = split_cmd_arg(arg);
@@ -645,19 +966,7 @@ bool handle_command(Config& cfg, const std::string& line,
     return true;
 }
 
-int main() {
-#if defined(_WIN32) || defined(__MINGW32__)
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0;
-    if (GetConsoleMode(hOut, &dwMode)) {
-        SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-    }
-    SetConsoleOutputCP(65001);
-#endif
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    Config cfg = load_config();
-    fs::create_directories(conf_dir());
-
+int console_main(Config& cfg) {
     std::cout << cyan(BANNER) << "\n";
     std::cout << dim("  v" + VERSION + "  ·  /help  ·  Ctrl+C\n\n");
 
@@ -685,6 +994,62 @@ int main() {
             cmd_send(cfg, line, messages, show_think);
         }
     }
-    curl_global_cleanup();
     return 0;
+}
+
+int tui_main(Config& cfg) {
+    tui.active = true;
+    tui.enter();
+    LogBuf lbuf;
+    auto* old_out = std::cout.rdbuf(&lbuf);
+    auto* old_err = std::cerr.rdbuf(&lbuf);
+
+    tui.update_status(cfg);
+    std::cout << paint("38;5;208", L("Привет! Я kinecode.", "Hi! I'm kinecode.")) << "\n";
+    std::cout << dim(L("Напиши вопрос или /help — команды. /exit — выход.",
+                       "Type a question or /help for commands. /exit to quit.")) << "\n";
+    std::cout.flush();
+
+    std::vector<json> messages;
+    bool show_think = true;
+
+    for (;;) {
+        tui.update_status(cfg);
+        std::string line = tui.read_line();
+        if (line == "\x04") break;
+        if (line.empty()) continue;
+        tui.flush_partial();
+        tui.log.push_back(paint("38;5;208", " ❯ ") + line);
+        bool cont = handle_command(cfg, line, messages, show_think);
+        std::cout.flush();
+        tui.flush_partial();
+        tui.draw();
+        if (!cont) break;
+    }
+
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    tui.leave();
+    return 0;
+}
+
+int main() {
+#if defined(_WIN32) || defined(__MINGW32__)
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    if (GetConsoleMode(hOut, &dwMode)) {
+        SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+    SetConsoleOutputCP(65001);
+    bool tty_in = _isatty(_fileno(stdin)) != 0;
+#else
+    bool tty_in = isatty(STDIN_FILENO) != 0;
+#endif
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    Config cfg = load_config();
+    try { fs::create_directories(conf_dir()); } catch (...) {}
+
+    int rc = tty_in ? tui_main(cfg) : console_main(cfg);
+    curl_global_cleanup();
+    return rc;
 }
