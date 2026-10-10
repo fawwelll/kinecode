@@ -15,6 +15,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev libreadline-dev pkg-config
       - name: build
         run: g++ -std=c++17 -O2 $(pkg-config --cflags libcurl) -o kinecode-linux kinecode.cpp $(pkg-config --libs libcurl) -lreadline
+      - name: smoke test (tls)
+        run: |
+          printf '/addprovider t\nhttps://api.deepseek.com/v1\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode-linux > out.txt || true
+          cat out.txt
+          grep -q "HTTP 401" out.txt
       - uses: actions/upload-artifact@v4
         with:
           name: kinecode-linux
@@ -30,9 +35,23 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          update: false
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-curl mingw-w64-x86_64-nlohmann-json
-      - name: build
-        run: g++ -std=c++17 -O2 -o kinecode.exe kinecode.cpp -lcurl -lws2_32 -lwldap32 -static-libgcc -static-libstdc++
+      - name: build (fully static)
+        run: g++ -std=c++17 -O2 -DCURL_STATICLIB -o kinecode.exe kinecode.cpp -static -lcurl -lssl -lcrypto -lssh2 -lnghttp2 -lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -lcares -lpsl -lidn2 -lunistring -liconv -lintl -lgnutls -lhogweed -lnettle -lgmp -ltasn1 -lffi -lzstd -lz -lbrotlidec -lbrotlicommon -lws2_32 -lwldap32 -lcrypt32 -lbcrypt -lnormaliz -liphlpapi -lsecur32
+      - name: verify no non-system dlls
+        run: |
+          imports=$(objdump -x kinecode.exe | grep -iE "DLL Name" || true)
+          echo "$imports"
+          if echo "$imports" | grep -iqE "libcurl|libwinpthread|libstdc|libgcc"; then
+            echo "ERROR: non-system DLL dependency found"
+            exit 1
+          fi
+      - name: smoke test (tls via native ca)
+        run: |
+          printf '/addprovider t\nhttps://api.deepseek.com/v1\nsk-dummy\n/fetchmodels\n/exit\n' | ./kinecode.exe > out.txt || true
+          cat out.txt
+          grep -q "HTTP 401" out.txt
       - uses: actions/upload-artifact@v4
         with:
           name: kinecode-windows

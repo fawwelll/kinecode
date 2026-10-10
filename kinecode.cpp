@@ -27,7 +27,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.3";
+const std::string VERSION = "0.3.1";
 
 int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
@@ -275,17 +275,26 @@ size_t stream_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
+void apply_tls(CURL* curl) {
+#if defined(_WIN32) || defined(__MINGW32__)
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#else
+    (void)curl;
+#endif
+}
+
 CurlResponse http_get(const std::string& url, const std::string& key) {
     CURL* curl = curl_easy_init();
     CurlResponse resp;
     if (!curl) return resp;
+    apply_tls(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3.1");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status);
@@ -299,6 +308,7 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
                       std::function<void(const std::string&, const std::string&)> on_chunk) {
     CURL* curl = curl_easy_init();
     if (!curl) return false;
+    apply_tls(curl);
     std::string body = payload.dump();
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
@@ -307,7 +317,7 @@ bool chat_stream_curl(const std::string& url, const std::string& key,
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, ("Authorization: Bearer " + key).c_str());
-    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3");
+    headers = curl_slist_append(headers, "User-Agent: kinecode/0.3.1");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     StreamState st{on_chunk, "", show_think};

@@ -8,10 +8,15 @@ Written in pure C++17. No frameworks, no heavy dependencies. Just `libcurl` and 
 
 Pre-built binaries are available on the [Releases](https://github.com/fawwelll/kinecode/releases) page:
 
-- **`kinecode-linux`** — for Debian, Arch, Ubuntu, Fedora, any Linux x86_64
-- **`kinecode.exe`** — for Windows 10/11 (no dependencies needed)
+- **`kinecode-linux`** — for Debian, Arch, Ubuntu, Fedora, any Linux x86_64. `chmod +x kinecode-linux` and run.
+- **`kinecode.exe`** — for Windows 10/11. Fully static, single file, no DLLs needed.
 
-Just download, make executable (`chmod +x kinecode-linux`), and run.
+### Windows SmartScreen note
+
+Since the binary is not code-signed, Windows SmartScreen may show
+*"Windows protected your PC"* on first launch. Click **More info** →
+**Run anyway**. This is normal for open-source apps without a paid
+signing certificate.
 
 ## Features
 
