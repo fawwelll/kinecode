@@ -4,6 +4,15 @@ Minimal terminal client for any OpenAI-compatible API — DeepSeek, Groq, OpenRo
 
 Written in pure C++17. No frameworks, no heavy dependencies. Just `libcurl` and `nlohmann/json`.
 
+## Download
+
+Pre-built binaries are available on the [Releases](https://github.com/fawwelll/kinecode/releases) page:
+
+- **`kinecode-linux`** — for Debian, Arch, Ubuntu, Fedora, any Linux x86_64
+- **`kinecode.exe`** — for Windows 10/11 (no dependencies needed)
+
+Just download, make executable (`chmod +x kinecode-linux`), and run.
+
 ## Features
 
 - **Multi-provider** — switch between APIs on the fly
@@ -11,6 +20,7 @@ Written in pure C++17. No frameworks, no heavy dependencies. Just `libcurl` and 
 - **Reasoning support** — shows/hides model thinking process (`/think on|off`)
 - **File upload** — send text files to the model (`/file <path>`)
 - **Image upload** — send photos for vision models (`/img <path>`)
+- **Language switch** — `/language ru|en`
 - **Config persistence** — providers, keys, and history saved locally
 - **Zero bloat** — single binary, ~400KB
 
@@ -51,6 +61,7 @@ Then chat. Type `/help` for all commands.
 | `/think on\|off` | Toggle reasoning output |
 | `/file <path> [question]` | Send text file |
 | `/img <path> [question]` | Send image (png/jpg/webp/gif) |
+| `/language ru\|en` | Switch interface language |
 | `/about` | About this project |
 | `/clear` | Clear conversation |
 | `/help` | Show help |

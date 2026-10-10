@@ -12,8 +12,14 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#if defined(_WIN32) || defined(__MINGW32__)
+#include <windows.h>
+#include <conio.h>
+#include <io.h>
+#else
 #include <termios.h>
 #include <unistd.h>
+#endif
 #include <curl/curl.h>
 #include "nlohmann/json.hpp"
 
@@ -27,14 +33,24 @@ int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
 
 fs::path conf_dir() {
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA");
+    fs::path base = appdata ? appdata : ".";
+    return base / APP;
+#else
     const char* xdg = std::getenv("XDG_CONFIG_HOME");
     fs::path base = xdg && *xdg ? xdg : fs::path(std::getenv("HOME")) / ".config";
     return base / APP;
+#endif
 }
 fs::path conf_file() { return conf_dir() / "config.json"; }
 fs::path hist_file() { return conf_dir() / "history"; }
 
+#if defined(_WIN32) || defined(__MINGW32__)
+bool COLOR = _isatty(_fileno(stdout)) && !std::getenv("NO_COLOR");
+#else
 bool COLOR = isatty(STDOUT_FILENO) && !std::getenv("NO_COLOR");
+#endif
 
 std::string paint(const std::string& code, const std::string& s) {
     if (!COLOR) return s;
@@ -167,7 +183,9 @@ void save_config(const Config& cfg) {
     j["lang"] = lang;
     std::ofstream f(conf_file());
     f << j.dump(2);
+    #ifndef _WIN32
     fs::permissions(conf_file(), fs::perms::owner_read | fs::perms::owner_write);
+#endif
 }
 
 std::string get_key(const std::string& name, const Provider& p) {
@@ -185,16 +203,25 @@ Provider* active_provider(Config& cfg) {
 }
 
 std::string getpass_cpp(const std::string& prompt) {
+    std::cout << prompt;
+    std::string pass;
+#ifdef _WIN32
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    GetConsoleMode(hStdin, &mode);
+    SetConsoleMode(hStdin, mode & ~ENABLE_ECHO_INPUT);
+    std::getline(std::cin, pass);
+    SetConsoleMode(hStdin, mode);
+#else
     struct termios oldt, newt;
     tcgetattr(STDIN_FILENO, &oldt);
     newt = oldt;
     newt.c_lflag &= ~ECHO;
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    std::cout << prompt;
-    std::string pass;
     std::getline(std::cin, pass);
-    std::cout << "\n";
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+#endif
+    std::cout << "\n";
     return pass;
 }
 
@@ -607,6 +634,14 @@ bool handle_command(Config& cfg, const std::string& line,
 }
 
 int main() {
+#if defined(_WIN32) || defined(__MINGW32__)
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    if (GetConsoleMode(hOut, &dwMode)) {
+        SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+    SetConsoleOutputCP(65001);
+#endif
     curl_global_init(CURL_GLOBAL_DEFAULT);
     Config cfg = load_config();
     fs::create_directories(conf_dir());

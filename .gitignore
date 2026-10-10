@@ -1,0 +1,11 @@
+kinecode
+kinecode.exe
+kinecode-linux
+*.o
+*.a
+include/
+win-lib/
+.venv/
+venv/
+__pycache__/
+*.pyc
