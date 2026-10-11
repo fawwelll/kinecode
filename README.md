@@ -107,6 +107,9 @@ A sample `/review` plugin is created on first launch.
 | `/key [name]` | Change API key |
 | `/system [text]` | Set system prompt |
 | `/think on\|off` | Toggle reasoning output |
+| `/new` | Start a new session |
+| `/undo` | Undo the last exchange |
+| `/export [file.md]` | Export the chat to markdown |
 | `/file <path> [question]` | Send a text file |
 | `/img <path> [question]` | Send an image (png/jpg/webp/gif) |
 | `/language ru\|en` | Switch interface language |
@@ -115,7 +118,11 @@ A sample `/review` plugin is created on first launch.
 | `/help` | Show help |
 | `/exit` | Quit |
 
-Shortcuts: **ctrl+p** command palette · **↑/↓** input history · **ctrl+c** interrupt streaming · **ctrl+d** quit.
+Shortcuts: **ctrl+p** command palette · **ctrl+a** model picker · **tab / shift+tab** cycle agent mode · **esc** clear input · **↑/↓** input history · **ctrl+c** interrupt streaming · **ctrl+d** quit.
+
+Inline tricks: `!<cmd>` runs a shell command and prints the output into the chat; `@<file> [question]` attaches a file (same as `/file`).
+
+Settings are organized as tabs, like OpenCode: **Provider · Agent · Interface** — switch with **←/→**.
 
 ## Config
 

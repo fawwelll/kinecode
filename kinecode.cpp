@@ -32,7 +32,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 const std::string APP = "kinecode";
-const std::string VERSION = "0.7.0";
+const std::string VERSION = "0.8.0";
 
 int lang = 0; // 0=ru, 1=en
 std::string L(const std::string& ru, const std::string& en) { return lang ? en : ru; }
@@ -118,11 +118,16 @@ std::string help_text() {
   /think on|off           toggle reasoning output
   /file <path> [question] send text file
   /img <path> [question]  send image (png/jpg/webp/gif)
+  /new                    new session
+  /undo                   undo last exchange
+  /export [file.md]       export chat to markdown
+  /settings               settings (tabs: Provider/Agent/Interface)
   /language ru|en         switch language
   /about                  about
   /clear                  clear chat
   /help  /exit
-Ctrl+C interrupts streaming.)";
+  !<cmd>                  run shell command   @<file>  attach file
+Ctrl+C interrupts, Esc clears input, Tab switches agent mode.)";
     return R"(Команды:
   /providers              список провайдеров
   /provider [имя]         переключить провайдера
@@ -136,11 +141,16 @@ Ctrl+C interrupts streaming.)";
   /think on|off           показывать рассуждения модели
   /file <путь> [вопрос]   отправить текстовый файл
   /img <путь> [вопрос]    отправить фото (png/jpg/webp/gif)
+  /new                    новая сессия
+  /undo                   отменить последний обмен
+  /export [файл.md]       экспорт чата в markdown
+  /settings               настройки (вкладки: Провайдер/Агент/Интерфейс)
   /language ru|en         сменить язык
   /about                  о проекте
   /clear                  очистить диалог
   /help  /exit
-Ctrl+C прерывает ответ.)";
+  !<команда>              выполнить shell-команду   @<файл>  прикрепить файл
+Ctrl+C прерывает ответ, Esc очищает ввод, Tab переключает режим агента.)";
 }
 
 struct Provider {
@@ -264,12 +274,13 @@ std::string getpass_cpp(const std::string& prompt) {
 volatile bool g_interrupt = false;
 std::string g_status;
 bool tui_mask = false;
+bool g_show_think = true;
 long g_ctx_tokens = 0;
 
 struct Usage { bool got = false; long prompt = 0, completion = 0; };
 Usage g_usage;
 
-enum { K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_DEL, K_IGNORE };
+enum { K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_DEL, K_IGNORE, K_STAB };
 
 #ifdef _WIN32
 DWORD g_orig_inmode = 0;
@@ -353,7 +364,8 @@ struct Tui {
     int palSel = 0;
     bool setOpen = false;
     int setSel = 0, setModelSel = 0;
-    int setPage = 0; // 0=провайдеры, 1=модели
+    int setPage = 0; // 0=список провайдеров, 1=модели провайдера
+    int setTab = 0;  // 0=Provider · 1=Agent · 2=Interface
     std::string statusMsg;
     std::string providerPage;
     bool dlgOpen = false;
@@ -646,6 +658,9 @@ struct Tui {
                 { "/think",   L("рассуждения on|off", "reasoning on|off") },
             } },
             { L("Сессия", "Session"), {
+                { "/new",      L("новая сессия", "new session") },
+                { "/undo",     L("отменить последний обмен", "undo last exchange") },
+                { "/export",   L("экспорт чата в markdown", "export chat to markdown") },
                 { "/clear",    L("очистить чат", "clear chat") },
                 { "/language", L("язык ru|en", "language ru|en") },
                 { "/about",    L("о программе", "about") },
@@ -799,7 +814,7 @@ struct Tui {
     }
 
     bool run_settings(Config& cfg) {
-        setOpen = true; setPage = 0; setSel = 0; statusMsg.clear();
+        setOpen = true; setPage = 0; setSel = 0; setTab = 0; statusMsg.clear();
         for (;;) {
             draw();
             int k = get_key();
@@ -807,6 +822,33 @@ struct Tui {
             if (k == 27) { if (setPage == 0) break; else { setPage = 0; continue; } }
             auto names = providerNames(cfg);
             if (setPage == 0) {
+                if (k == K_LEFT)  { setTab = (setTab + 2) % 3; statusMsg.clear(); continue; }
+                if (k == K_RIGHT) { setTab = (setTab + 1) % 3; statusMsg.clear(); continue; }
+                if (setTab == 1) { // Agent
+                    if (k == 'm' || k == 'M') {
+                        if (cfg.mode == "full") cfg.mode = "folder";
+                        else if (cfg.mode == "folder") cfg.mode = "read";
+                        else cfg.mode = "full";
+                        save_config(cfg);
+                        statusMsg = L("режим: ", "mode: ") + cfg.mode;
+                    }
+                    if (k == 'w' || k == 'W') {
+                        std::string wd = run_dialog(L("рабочая папка агента:", "agent workdir:"),
+                                                    cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir, false);
+                        if (!wd.empty()) { cfg.workdir = wd; save_config(cfg); statusMsg = "workdir: " + wd; }
+                    }
+                    if (k == 't' || k == 'T') {
+                        g_show_think = !g_show_think;
+                        statusMsg = g_show_think ? L("рассуждения: on", "reasoning: on") : L("рассуждения: off", "reasoning: off");
+                    }
+                    continue;
+                }
+                if (setTab == 2) { // Interface
+                    if (k == 'r' || k == 'R') { lang = 0; save_config(cfg); statusMsg = "язык: русский"; }
+                    if (k == 'e' || k == 'E') { lang = 1; save_config(cfg); statusMsg = "language: english"; }
+                    if (k == 'c' || k == 'C') { COLOR = !COLOR; statusMsg = COLOR ? L("цвета: on", "colors: on") : L("цвета: off", "colors: off"); }
+                    continue;
+                }
                 if (k == K_UP && setSel > 0) setSel--;
                 if (k == K_DOWN && setSel < (int)names.size() - 1) setSel++;
                 if (k == 'a' || k == 'A') wizard(cfg);
@@ -947,14 +989,37 @@ struct Tui {
             modalRow(f, top, x0, w, head + std::string((size_t)gap, ' ') + esc);
         };
         if (setPage == 0) {
-            int avail = rows - 11; if (avail < 1) avail = 1;
+            int avail = rows - 13; if (avail < 1) avail = 1;
             int n = (int)names.size();
             int start = 0;
             if (n > avail) { start = setSel - avail / 2; if (start < 0) start = 0; if (start > n - avail) start = n - avail; }
             int shown = std::min(n, avail);
-            int top = (rows - (shown + 8)) / 2; if (top < 2) top = 2;
+            int top = (rows - (shown + 10)) / 2; if (top < 2) top = 2;
             modalHeader(top, L("Настройки", "Settings"));
-            modalRow(f, top + 1, x0, w, "");
+            std::string tabs;
+            std::string names3[3] = { L("Провайдер", "Provider"), L("Агент", "Agent"), L("Интерфейс", "Interface") };
+            for (int i = 0; i < 3; i++) {
+                std::string t = names3[i];
+                tabs += (i == setTab ? paint("1;38;5;215", "[ " + t + " ]") : fg("90", "  " + t + "  "));
+                if (i < 2) tabs += " ";
+            }
+            modalRow(f, top + 1, x0, w, clampVis(tabs + "   " + fg("90", "←/→"), innerW));
+            modalRow(f, top + 2, x0, w, "");
+            if (setTab == 1) {
+                std::string wd = cfg.workdir.empty() ? fs::current_path().string() : cfg.workdir;
+                modalRow(f, top + 3, x0, w, clampVis(L("режим доступа: ", "access mode: ") + paint("1", cfg.mode), innerW));
+                modalRow(f, top + 4, x0, w, clampVis(L("рабочая папка: ", "workdir: ") + fg("90", wd), innerW));
+                modalRow(f, top + 5, x0, w, clampVis(L("рассуждения: ", "reasoning: ") + std::string(g_show_think ? green("on") : fg("90", "off")), innerW));
+                modalRow(f, top + shown + 7, x0, w, fg("90", clampVis(L("m — режим · w — папка · t — рассуждения · ←/→ — вкладки", "m — mode · w — workdir · t — thinking · ←/→ — tabs"), innerW)));
+                return;
+            }
+            if (setTab == 2) {
+                modalRow(f, top + 3, x0, w, clampVis(L("язык: ", "language: ") + paint("1", lang ? "English" : "Русский"), innerW));
+                modalRow(f, top + 4, x0, w, clampVis(L("цвета: ", "colors: ") + std::string(COLOR ? green("on") : fg("90", "off")), innerW));
+                modalRow(f, top + 5, x0, w, fg("90", L("интерфейс собран по мотивам OpenCode, акцент — минимализм", "interface inspired by OpenCode, minimal focus")));
+                modalRow(f, top + shown + 7, x0, w, fg("90", clampVis(L("r — русский · e — english · c — цвета · ←/→ — вкладки", "r — russian · e — english · c — colors · ←/→ — tabs"), innerW)));
+                return;
+            }
             if (names.empty())
                 modalRow(f, top + 2, x0, w, fg("90", L("пусто — нажми a, чтобы добавить", "empty — press a to add")));
             for (int i = 0; i < shown; i++) {
@@ -1093,6 +1158,7 @@ struct Tui {
                 case 'C': return K_RIGHT;
                 case 'D': return K_LEFT;
                 case '3': { pollfd p4{0, POLLIN, 0}; if (poll(&p4, 1, 30) > 0) { unsigned char t; read(0, &t, 1); } return K_DEL; }
+                case 'Z': return K_STAB;
                 default: return K_IGNORE;
             }
         }
@@ -1117,6 +1183,22 @@ struct Tui {
                 g_interrupt = true;
                 return "\x04";
             }
+            if (k == 27) { input.clear(); continue; } // ESC очищает поле ввода, как в opencode
+            if (k == '\t' && pCfg) { // tab/shift+tab — режим агента: read → folder → full
+                if (pCfg->mode == "read") pCfg->mode = "folder";
+                else if (pCfg->mode == "folder") pCfg->mode = "full";
+                else pCfg->mode = "read";
+                save_config(*pCfg);
+                continue;
+            }
+            if (k == K_STAB && pCfg) {
+                if (pCfg->mode == "read") pCfg->mode = "full";
+                else if (pCfg->mode == "full") pCfg->mode = "folder";
+                else pCfg->mode = "read";
+                save_config(*pCfg);
+                continue;
+            }
+            if (k == 1) { return "/model"; } // ctrl+a — выбор модели
             if (k == '\r' || k == '\n') {
                 std::string v = input;
                 input.clear();
@@ -1452,7 +1534,7 @@ std::string agentPrompt(const Config& cfg) {
 }
 
 void cmd_send(Config& cfg, const std::string& text,
-              std::vector<json>& messages, bool show_think,
+              std::vector<json>& messages,
               const json& extra_content = json()) {
     Provider* p = active_provider(cfg);
     if (!p || cfg.active_model.empty()) {
@@ -1489,7 +1571,7 @@ void cmd_send(Config& cfg, const std::string& text,
         g_usage = Usage();
         if (tui.active) tui.beginStream();
 
-        bool ok = chat_stream_curl(url, key, payload, show_think,
+        bool ok = chat_stream_curl(url, key, payload, g_show_think,
             [&](const std::string& kind, const std::string& piece) {
                 if (kind == "think") {
                     if (!thinking) { std::cout << dim(L("┌ рассуждает\n", "┌ thinking\n")); thinking = true; }
@@ -1620,8 +1702,42 @@ std::pair<std::string, std::string> split_cmd_arg(const std::string& arg) {
     return {path, question};
 }
 
+std::string json_content_text(const json& j) {
+    if (j.is_string()) return j.get<std::string>();
+    if (j.is_array()) {
+        std::string out;
+        for (auto& c : j)
+            if (c.value("type", "") == "text") out += c.value("text", "");
+        return out;
+    }
+    return std::string();
+}
+
+bool undo_last_exchange(std::vector<json>& messages) {
+    while (!messages.empty() && messages.back().value("role", "") != "user")
+        messages.pop_back();
+    if (messages.empty()) return false;
+    messages.pop_back();
+    if (tui.active) {
+        if (!tui.msgs.empty() && tui.msgs.back().kind == MsgKind::Meta) tui.msgs.pop_back();
+        if (!tui.msgs.empty() && tui.msgs.back().kind == MsgKind::Assistant) tui.msgs.pop_back();
+        if (!tui.msgs.empty() && tui.msgs.back().kind == MsgKind::User) tui.msgs.pop_back();
+    }
+    return true;
+}
+
+bool export_chat_markdown(const std::vector<json>& messages, const std::string& path) {
+    std::string fp = path.empty() ? std::string("chat.md") : path;
+    std::ofstream o(fp);
+    if (!o) return false;
+    o << "# kinecode chat\n\n";
+    for (auto& m : messages)
+        o << "## " << m.value("role", "unknown") << "\n\n" << json_content_text(m["content"]) << "\n\n";
+    return true;
+}
+
 bool handle_command(Config& cfg, const std::string& line,
-                    std::vector<json>& messages, bool& show_think) {
+                    std::vector<json>& messages) {
     size_t sp = line.find(' ', 1);
     std::string cmd = (sp != std::string::npos) ? line.substr(1, sp - 1) : line.substr(1);
     std::string arg = (sp != std::string::npos) ? line.substr(sp + 1) : "";
@@ -1718,8 +1834,8 @@ bool handle_command(Config& cfg, const std::string& line,
         if (arg.empty()) std::cout << dim(cfg.system_prompt) << "\n";
         else { cfg.system_prompt = arg; save_config(cfg); std::cout << green(L("Обновлён", "Updated")) << "\n"; }
     } else if (cmd == "think") {
-        show_think = (arg != "off");
-        std::cout << dim(show_think ? L("Рассуждения: показываю", "Reasoning: shown") : L("Рассуждения: скрыты", "Reasoning: hidden")) << "\n";
+        g_show_think = (arg != "off");
+        std::cout << dim(g_show_think ? L("Рассуждения: показываю", "Reasoning: shown") : L("Рассуждения: скрыты", "Reasoning: hidden")) << "\n";
     } else if (cmd == "clear") {
         messages.clear();
         if (tui.active) tui.msgs.clear();
@@ -1737,7 +1853,7 @@ bool handle_command(Config& cfg, const std::string& line,
         if (content.size() > 120000) content = content.substr(0, 120000) + "\n...[обрезан]";
         std::string text = "[Файл: " + fp.filename().string() + "]\n```\n" + content + "\n```\n\n" + (question.empty() ? L("Опиши содержимое", "Describe the contents") : question);
         std::cout << dim(L("Отправляю файл ", "Sending file ") + fp.filename().string() + " ...") << "\n";
-        cmd_send(cfg, text, messages, show_think);
+        cmd_send(cfg, text, messages);
     } else if (cmd == "img") {
         auto [path, question] = split_cmd_arg(arg);
         if (path.empty()) { std::cerr << red(L("Укажи путь: /img <фото> [вопрос]\n", "Usage: /img <path> [question]\n")); return true; }
@@ -1764,7 +1880,7 @@ bool handle_command(Config& cfg, const std::string& line,
             cfg.active_model.find("vision") == std::string::npos) {
             std::cout << yellow(L("Внимание: модель '", "Warning: model '") + cfg.active_model + L("' возможно не поддерживает фото.", "' may not support images.")) << "\n";
         }
-        cmd_send(cfg, "", messages, show_think, content);
+        cmd_send(cfg, "", messages, content);
     } else if (cmd == "settings") {
         if (tui.active) tui.run_settings(cfg);
         else std::cout << dim(L("настройки доступны в TUI (запусти в терминале)", "settings available in TUI mode")) << "\n";
@@ -1809,6 +1925,23 @@ bool handle_command(Config& cfg, const std::string& line,
         } else {
             std::cout << dim(lang ? "Current: English. Use: /language ru|en" : "Текущий: русский. Использование: /language ru|en") << "\n";
         }
+    } else if (cmd == "new") {
+        messages.clear();
+        if (tui.active) { tui.msgs.clear(); tui.sessionTitle.clear(); }
+        std::cout << dim(L("Новая сессия", "New session")) << "\n";
+    } else if (cmd == "undo") {
+        if (undo_last_exchange(messages)) std::cout << dim(L("Последний обмен отменён", "Last exchange undone")) << "\n";
+        else std::cout << dim(L("Нечего отменять", "Nothing to undo")) << "\n";
+    } else if (cmd == "export") {
+        std::string path = arg.empty() ? std::string("chat.md") : arg;
+        if (path.find('/') != std::string::npos || path.find('\\') != std::string::npos) {
+            std::cerr << red(L("Экспорт только в текущую папку, без путей\n", "Export into current directory only, no paths\n"));
+            return true;
+        }
+        if (export_chat_markdown(messages, path)) std::cout << green(L("Сохранено в ", "Saved to ") + path) << "\n";
+        else std::cerr << red(L("Не удалось сохранить\n", "Save failed\n"));
+    } else if (cmd == "editor") {
+        std::cout << dim(L("Внешний редактор: открой файл через /file или вставь текст блоком.", "External editor: use /file or paste a text block.")) << "\n";
     } else {
         fs::path pp = conf_dir() / "plugins" / (cmd + ".md");
         if (fs::exists(pp)) {
@@ -1816,7 +1949,7 @@ bool handle_command(Config& cfg, const std::string& line,
             std::string tpl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             if (!arg.empty()) tpl += "\n\n" + arg;
             std::cout << dim(L("плагин: ", "plugin: ") + cmd) << "\n";
-            cmd_send(cfg, tpl, messages, show_think);
+            cmd_send(cfg, tpl, messages);
         } else {
             std::cerr << red(L("Неизвестная команда /" + cmd + ". Список: /help", "Unknown command /" + cmd + ". See: /help")) << "\n";
         }
@@ -1829,7 +1962,6 @@ int console_main(Config& cfg) {
     std::cout << dim("  v" + VERSION + "  ·  /help  ·  Ctrl+C\n\n");
 
     std::vector<json> messages;
-    bool show_think = true;
     std::string line;
 
     while (true) {
@@ -1846,10 +1978,19 @@ int console_main(Config& cfg) {
             line += "\n" + next;
         }
         if (line.empty()) continue;
+        if (line[0] == '!') {
+            std::string sh = line.substr(1);
+            std::cout << dim("$ " + sh) << "\n";
+            std::string out = execShell(sh);
+            if (out.size() > 4000) out = out.substr(0, 4000) + "\n…";
+            std::cout << dim(out) << "\n";
+            continue;
+        }
+        if (line[0] == '@') line = "/file " + line.substr(1);
         if (line[0] == '/') {
-            if (!handle_command(cfg, line, messages, show_think)) break;
+            if (!handle_command(cfg, line, messages)) break;
         } else {
-            cmd_send(cfg, line, messages, show_think);
+            cmd_send(cfg, line, messages);
         }
     }
     return 0;
@@ -1867,13 +2008,22 @@ int tui_main(Config& cfg) {
     tui.update_status(cfg);
 
     std::vector<json> messages;
-    bool show_think = true;
 
     for (;;) {
         tui.update_status(cfg);
         std::string line = tui.read_line();
         if (line == "\x04") break;
         if (line.empty()) continue;
+        if (line[0] == '!') {
+            std::string sh = line.substr(1);
+            tui.addMsg(MsgKind::Info, "$ " + sh);
+            std::string out = execShell(sh);
+            if (out.size() > 4000) out = out.substr(0, 4000) + "\n…";
+            tui.addMsg(MsgKind::Info, out.empty() ? std::string("(no output)") : out);
+            tui.draw();
+            continue;
+        }
+        if (line[0] == '@') line = "/file " + line.substr(1);
         tui.addMsg(MsgKind::User, line);
         if (tui.sessionTitle.empty()) {
             tui.sessionTitle = line;
@@ -1882,8 +2032,8 @@ int tui_main(Config& cfg) {
             if (tui.sessionTitle.size() > 34) tui.sessionTitle = tui.sessionTitle.substr(0, 34) + "…";
         }
         bool cont = (line[0] == '/')
-            ? handle_command(cfg, line, messages, show_think)
-            : (cmd_send(cfg, line, messages, show_think), true);
+            ? handle_command(cfg, line, messages)
+            : (cmd_send(cfg, line, messages), true);
         std::cout.flush();
         tui.draw();
         if (!cont) break;
